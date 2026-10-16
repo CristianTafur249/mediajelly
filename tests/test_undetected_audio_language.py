@@ -50,3 +50,24 @@ def test_detector_returns_none_when_no_sample_can_be_analyzed(monkeypatch, tmp_p
 
     assert detector_module.detect_language_with_multiple_samples(None, tmp_path / "x.mp4", 1, 1200) is None
     assert detector_module.detect_single_sample(None, tmp_path / "x.mp4", 1, 30) is None
+
+
+def test_json_cache_is_not_used_as_fallback(monkeypatch, tmp_path):
+    """language_cache.json va por ruta: puede traer el idioma de otro archivo en la misma ruta."""
+    video = tmp_path / "media" / "Serie" / "Serie - S01E01.mp4"
+    video.parent.mkdir(parents=True)
+    video.write_bytes(b"x" * 100)
+    instance = LanguageDetectionMixin.__new__(LanguageDetectionMixin)
+    instance.logger = _Logger()
+    instance.whisper_enabled = False
+    instance.whisper_model = None
+    relative = str(video.resolve()).split("/media/", 1)[1]
+    instance.language_cache = {relative: {"1": "jpn"}, str(video.resolve()): {"1": "jpn"}}
+    monkeypatch.setattr(detection_module, "get_cached_language", lambda *a, **k: None)
+    monkeypatch.setattr(
+        detection_module.subprocess,
+        "run",
+        lambda *a, **k: subprocess.CompletedProcess(a, 0, stdout="", stderr=""),
+    )
+
+    assert instance.detect_audio_language(video, 1, allow_whisper_fallback=False) is None

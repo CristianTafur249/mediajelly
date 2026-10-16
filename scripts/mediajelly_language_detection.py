@@ -3,21 +3,18 @@
 mediajelly_language_detection.py
 
 Mixin con la detección de idioma de pistas de audio usando Whisper
-(carga lazy del modelo, muestreo múltiple del archivo, caché de idiomas
-detectados, normalización a códigos ISO de 3 letras).
+(carga lazy del modelo, muestreo múltiple del archivo, idiomas guardados
+por huella en la BD, normalización a códigos ISO de 3 letras).
 
 Extraído de MediaJellyProcessor (mediajelly_processor.py) para reducir el
 tamaño de esa clase y aislar esta responsabilidad.
 
 Requiere que la clase que lo use tenga disponibles (provistos por
 MediaJellyProcessor.__init__): `self.logger`, `self.whisper_enabled`,
-`self.whisper_model`, `self.language_cache_file`, `self.language_cache`,
-y demás configuración de muestreo (max_samples_per_file, etc.) usada por
+`self.whisper_model` y demás configuración de muestreo (max_samples_per_file, etc.) usada por
 estos métodos.
 """
 
-import os
-import json
 import subprocess
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -31,10 +28,15 @@ except Exception:
     get_config = None
 
 try:
-    from mediajelly_language_detector import set_cached_language, detect_language_with_whisper_for_processor
+    from mediajelly_language_detector import (
+        get_cached_language,
+        set_cached_language,
+        detect_language_with_whisper_for_processor,
+    )
     LANGUAGE_DETECTOR_AVAILABLE = True
 except Exception:
     LANGUAGE_DETECTOR_AVAILABLE = False
+    get_cached_language = None
     set_cached_language = None
     detect_language_with_whisper_for_processor = None
 
@@ -69,33 +71,6 @@ class LanguageDetectionMixin:
                 self.whisper_model = None
                 return False
         return True
-
-    def _load_language_cache(self) -> dict:
-        """Carga el caché de idiomas pre-detectados por mediajelly_language_detector.py"""
-        if self.language_cache_file.exists():
-            try:
-                # Check if file is empty before parsing
-                if self.language_cache_file.stat().st_size == 0:
-                    self.logger.warning(f"{EmojiGenerator.warning_msg()} Caché de idiomas vacío, inicializando...")
-                    return {}
-
-                with open(self.language_cache_file, "r", encoding="utf-8") as f:
-                    try:
-                        cache = json.load(f)
-                    except json.JSONDecodeError as e:
-                        # Archivo corrupto: mover a backup y reinicializar caché
-                        backup_path = self.language_cache_file.with_suffix(".corrupt.json")
-                        try:
-                            os.replace(str(self.language_cache_file), str(backup_path))
-                            self.logger.warning(f"{EmojiGenerator.warning_msg()} Caché corrupto movido a {backup_path}")
-                        except Exception:
-                            self.logger.warning(f"{EmojiGenerator.warning_msg()} No se pudo mover caché corrupto: {e}")
-                        return {}
-                self.logger.info(f"{EmojiGenerator.folder()} Caché de idiomas cargado: {len(cache)} archivos")
-                return cache
-            except Exception as e:
-                self.logger.warning(f"{EmojiGenerator.warning_msg()} Error cargando caché de idiomas: {e}")
-        return {}
 
     def _ensure_three_letter_codes(self, audio_languages: Dict[int, str]) -> Dict[int, str]:
         """Asegura que los valores de audio_languages sean códigos ISO 639-2 (tres letras).
@@ -371,8 +346,8 @@ class LanguageDetectionMixin:
         self, file_path: Path, stream_index: int, allow_whisper_fallback: bool = True
     ) -> Optional[str]:
         """
-        Detecta el idioma de una pista de audio usando el caché pre-analizado.
-        Si no está en caché, NO asume ningún idioma (retorna None).
+        Detecta el idioma de una pista de audio usando el idioma guardado en la BD.
+        Si no está guardado, NO asume ningún idioma (retorna None).
 
         Args:
             allow_whisper_fallback: Si es False, no se carga un modelo Whisper
@@ -384,77 +359,21 @@ class LanguageDetectionMixin:
                 separado.
         """
         try:
-            # Normalizar la ruta para comparación consistente
             file_path_resolved = file_path.resolve()
-            file_path_str = str(file_path_resolved)
 
-            # Crear ruta relativa al directorio media para búsqueda en caché
-            relative_path = None
-            # Aceptar tanto /media/ (host-standard) como /mediajelly/media/ (contract inside container)
-            if "/mediajelly/media/" in file_path_str:
-                relative_path = file_path_str.split("/mediajelly/media/", 1)[1]
-            elif "/media/" in file_path_str:
-                relative_path = file_path_str.split("/media/", 1)[1]
-
-            # Paso 1: Verificar caché de idiomas pre-detectados
-            cached_lang = None
-            if relative_path and relative_path in self.language_cache:
-                stream_idx_str = str(stream_index)
-                if stream_idx_str in self.language_cache[relative_path]:
-                    cached_lang = self.language_cache[relative_path][stream_idx_str]
-                    # Normalizar a código ISO 639-2 de 3 letras (ffmpeg espera 3 letras en tags)
-                    try:
-                        if get_config:
-                            cfg = get_config()
-                            inv_map = {v: k for k, v in cfg.language_detection.language_code_map.items()}
-                            orig_cached = cached_lang
-                            if cached_lang in inv_map:
-                                cached_lang = inv_map[cached_lang]
-                            if orig_cached != cached_lang:
-                                self.logger.info(
-                                    f"{EmojiGenerator.clipboard()} Caché: mapeado '{orig_cached}' -> '{cached_lang}' para {relative_path}"
-                                )
-                    except Exception:
-                        pass
+            # Paso 0: idioma guardado por huella en la BD (sobrevive a renombrados)
+            if get_cached_language:
+                db_lang = get_cached_language(file_path_resolved, stream_index)
+                if db_lang:
                     self.logger.info(
-                        f"{EmojiGenerator.folder()} Idioma desde caché: {cached_lang} (stream {stream_index}) - key: {relative_path}"
+                        f"{EmojiGenerator.folder()} Idioma desde BD: {db_lang} (stream {stream_index}) - {file_path.name}"
                     )
-                    return cached_lang
-            elif file_path_str in self.language_cache:  # Fallback a ruta absoluta
-                stream_idx_str = str(stream_index)
-                if stream_idx_str in self.language_cache[file_path_str]:
-                    cached_lang = self.language_cache[file_path_str][stream_idx_str]
-                    try:
-                        if get_config:
-                            cfg = get_config()
-                            inv_map = {v: k for k, v in cfg.language_detection.language_code_map.items()}
-                            orig_cached = cached_lang
-                            if cached_lang in inv_map:
-                                cached_lang = inv_map[cached_lang]
-                            if orig_cached != cached_lang:
-                                self.logger.info(
-                                    f"{EmojiGenerator.clipboard()} Caché: mapeado '{orig_cached}' -> '{cached_lang}' para {file_path_str}"
-                                )
-                    except Exception:
-                        pass
-                    self.logger.info(
-                        f"{EmojiGenerator.folder()} Idioma desde caché: {cached_lang} (stream {stream_index}) - key: {file_path_str}"
-                    )
-                    return cached_lang
-                else:
-                    self.logger.debug(
-                        f"{EmojiGenerator.warning_msg()} Archivo en caché pero stream {stream_index} no encontrado: {file_path.name}"
-                    )
-            else:
-                # Debug: mostrar algunas claves del caché para verificar formato de rutas
-                if self.language_cache:
-                    cache_keys = list(self.language_cache.keys())[:3]
-                    self.logger.debug(f"{EmojiGenerator.warning_msg()} Archivo no en caché: {file_path_str}")
-                    if relative_path:
-                        self.logger.debug(f"{EmojiGenerator.warning_msg()} Ruta relativa no en caché: {relative_path}")
-                    self.logger.debug(f"{EmojiGenerator.clipboard()} Ejemplos de rutas en caché: {cache_keys}")
+                    return db_lang
 
-            # Paso 2: Intentar detección por metadatos (solo si hay metadatos claros)
+            # (language_cache.json ya no se consulta: va por ruta y puede traer el
+            # idioma de otro archivo que estuvo en la misma ruta)
+
+            # Paso 1: Intentar detección por metadatos (solo si hay metadatos claros)
             cmd = [
                 "ffprobe",
                 "-v",
@@ -499,7 +418,7 @@ class LanguageDetectionMixin:
                         )
                         return "jpn"
 
-            # Paso 3: Intentar detección con Whisper si está disponible
+            # Paso 2: Intentar detección con Whisper si está disponible
             if not allow_whisper_fallback:
                 self.logger.debug(
                     f"{EmojiGenerator.warning_msg()} Stream {stream_index} sin idioma en caché/metadatos, "

@@ -29,11 +29,21 @@ from mediajelly_emoji import EmojiGenerator
 from mediajelly_utils import MediaJellyPaths
 from mediajelly_db import (
     get_pending_files,
-    get_all_completed_files,
-    add_pending,
-    remove_pending,
-    mark_completed,
+    register,
+    get_by_path,
+    set_stream_language,
+    get_stream_languages,
+    normalize_lang,
+    record_rewrite,
+    record_retag_failure,
+    has_retag_failure,
+    list_language_candidates,
+    record_language_attempt,
+    migration_pending,
+    MIGRATION_PENDING_MESSAGE,
 )
+import mediajelly_retag
+from mediajelly_retag import retag_audio
 
 # Importar configuración centralizada
 from mediajelly_config import MediaJellyConfig
@@ -200,6 +210,9 @@ def load_cache() -> Dict[str, Any]:
     """
     Carga el caché de idiomas detectados desde el archivo JSON.
 
+    Ya no se usa en la detección (los idiomas viven en la BD por huella); se
+    conserva solo como referencia de la migración del estado anterior.
+
     Returns:
         Dict[str, Any]: Diccionario con el caché cargado o vacío si hay error.
     """
@@ -222,79 +235,10 @@ def load_cache() -> Dict[str, Any]:
     return {}
 
 
-def save_cache(cache: Dict[str, Any]) -> None:
-    """
-    Guarda el caché de idiomas detectados en el archivo JSON.
-    Maneja robustamente errores de permisos y conflictos de escritura.
-
-    Args:
-        cache: Diccionario con los datos a guardar.
-    """
-    try:
-        os.makedirs(os.path.dirname(CACHE_FILE_PATH), exist_ok=True)
-
-        # Si el archivo existe, intentar cambiar sus permisos primero
-        if Path(CACHE_FILE_PATH).exists():
-            try:
-                os.chmod(CACHE_FILE_PATH, 0o666)
-            except Exception as chmod_err:
-                log(f"Aviso: No se pudieron cambiar permisos del caché existente: {chmod_err}", "WARNING")
-
-        # Guardado atómico: escribir en archivo temporal y renombrar
-        temp_path = f"{CACHE_FILE_PATH}.tmp"
-        try:
-            with open(temp_path, "w", encoding="utf-8") as f:
-                json.dump(cache, f, indent=2, ensure_ascii=False)
-                f.flush()
-                try:
-                    os.fsync(f.fileno())
-                except Exception:
-                    # No es crítico si fsync falla en algunos sistemas
-                    pass
-
-            # Establecer permisos del archivo temporal antes de reemplazar
-            try:
-                os.chmod(temp_path, 0o666)
-            except Exception:
-                # No es crítico si no se pueden cambiar permisos del temporal
-                pass
-
-            # Reemplazar archivo existente
-            try:
-                os.replace(temp_path, CACHE_FILE_PATH)
-            except OSError as replace_err:
-                # Si replace falla, intentar con remove + rename
-                try:
-                    if Path(CACHE_FILE_PATH).exists():
-                        os.chmod(CACHE_FILE_PATH, 0o666)  # Intentar permisos primero
-                        os.remove(CACHE_FILE_PATH)
-                    os.rename(temp_path, CACHE_FILE_PATH)
-                except Exception as fallback_err:
-                    log(f"Error guardando caché (fallback falló): {fallback_err}", "ERROR")
-                    raise
-
-            # Asegurar permisos finales de escritura para todos los usuarios
-            try:
-                os.chmod(CACHE_FILE_PATH, 0o666)
-            except Exception:
-                pass
-
-            log(f"Caché guardado: {len(cache)} archivos", "SUCCESS")
-        except Exception as e:
-            # Limpiar archivo temporal si quedó
-            try:
-                if Path(temp_path).exists():
-                    os.remove(temp_path)
-            except Exception:
-                pass
-            log(f"Error guardando caché: {e}", "ERROR")
-    except Exception as e:
-        log(f"Error guardando caché (outer): {e}", "ERROR")
-
-
 # ---------------------------------------------------------------------------
 # Normalización / renaming helpers (usados por el detector)
 # ---------------------------------------------------------------------------
+
 def _clean_filename_formatting(filename: str) -> str:
     """Limpia espacios múltiples, guiones redundantes y formato del nombre"""
     import re
@@ -398,20 +342,15 @@ def _rename_file_safely(file_path: Path, new_name: str, extension: str) -> Optio
 
 
 def _update_pending_and_completed(old_path: Path, new_path: Path) -> None:
-    """Reemplaza rutas antiguas en pending y completed usando la DB."""
+    """Registra la ruta nueva tras un renombrado.
+
+    El estado va por huella de contenido: register detecta el renombrado y
+    conserva el estado (pending, done, ...) de la ruta anterior.
+    """
     try:
-        old_str = str(old_path)
-        new_str = str(new_path)
-
-        if old_str in set(get_pending_files()):
-            remove_pending(old_str)
-            add_pending(new_str)
-
-        if old_str in set(get_all_completed_files()):
-            mark_completed(new_str)
-
+        register(str(new_path), require_settled=False)
     except Exception as e:
-        log(f"Error actualizando pending/completed: {e}", "ERROR")
+        log(f"Error registrando el renombrado {old_path} → {new_path}: {e}", "ERROR")
 
 
 def adjust_pending_names() -> None:
@@ -488,123 +427,91 @@ def get_file_hash(file_path: Union[str, Path]) -> Optional[str]:
 
 def get_cached_language(file_path: Union[str, Path], stream_index: int) -> Optional[str]:
     """
-    Obtiene el idioma cacheado para un archivo y stream específico.
+    Obtiene el idioma guardado para un archivo y stream específico.
 
-    Intenta obtenerlo de Redis primero, y luego del caché local en archivo.
+    El idioma se guarda por huella de contenido, así que sobrevive a renombrados.
 
     Args:
         file_path: Ruta del archivo.
-        stream_index: Índice del stream de audio.
+        stream_index: Índice absoluto del stream (el `index` de ffprobe).
 
     Returns:
-        str: Código de idioma si se encuentra, None en caso contrario.
+        str: Código ISO 639-2 de 3 letras si se encuentra, None en caso contrario.
     """
-    redis_client = get_redis_client()
-    if not redis_client:
-        # Fallback al cache de archivo, admitir varias formas de llave
-        cache = load_cache()
-        file_path_str = str(file_path)
-        candidate_keys = [file_path_str]
-        # Agregar claves alternativas (relative, media vs mediajelly/media)
-        if "/mediajelly/media/" in file_path_str:
-            rel = file_path_str.split("/mediajelly/media/", 1)[1]
-            candidate_keys.append(rel)
-            candidate_keys.append(f"/media/{rel}")
-        elif "/media/" in file_path_str:
-            rel = file_path_str.split("/media/", 1)[1]
-            candidate_keys.append(rel)
-            candidate_keys.append(f"/mediajelly/media/{rel}")
-
-        # CORRECCIÓN: También buscar por nombre de archivo si todo lo demás falla
-        file_name = Path(file_path_str).name
-        candidate_keys.append(file_name)
-
-        for file_key in candidate_keys:
-            if file_key in cache:
-                stream_key = str(stream_index)
-                if stream_key in cache[file_key]:
-                    log(f"Cache hit (clave: {file_key[:50]}...) para stream {stream_index}", "SUCCESS")
-                    return cache[file_key][stream_key]
-        return None
-
-    # Usar Redis cache
-    file_hash = get_file_hash(file_path)
-    if not file_hash:
-        return None
-
-    cache_key = f"lang:{file_hash}:{stream_index}"
     try:
-        cached_result = redis_client.get(cache_key)
-        if cached_result:
-            log(f"Cache hit para {file_path} stream {stream_index}: {cached_result}", "SUCCESS")
-            return cached_result
+        record, _ = register(file_path, require_settled=False)
+        if record is None:
+            return None
+        lang = get_stream_languages(record.fingerprint).get(int(stream_index))
+        if lang and lang != "und":
+            log(f"Idioma guardado para {Path(file_path).name} stream {stream_index}: {lang}", "SUCCESS")
+            return lang
     except Exception as e:
-        log(f"Error leyendo cache Redis: {e}", "WARNING")
-
+        log(f"Error leyendo idioma guardado: {e}", "WARNING")
     return None
 
 
 def set_cached_language(file_path: Union[str, Path], stream_index: int, language: str) -> None:
     """
-    Guarda el idioma detectado en caché (Redis y/o archivo).
+    Guarda el idioma detectado asociado a la huella del archivo.
 
     Args:
         file_path: Ruta del archivo.
-        stream_index: Índice del stream de audio.
+        stream_index: Índice absoluto del stream (el `index` de ffprobe).
         language: Código de idioma detectado.
     """
-    redis_client = get_redis_client()
-    if not redis_client:
-        # Fallback al cache de archivo
-        cache = load_cache()
-        file_path_str = str(file_path)
-        # Guardar tanto la ruta absoluta como forma relativa (para robustez across mounts)
-        keys_to_set = [file_path_str]
-        if "/mediajelly/media/" in file_path_str:
-            rel = file_path_str.split("/mediajelly/media/", 1)[1]
-            keys_to_set.append(rel)
-            keys_to_set.append(f"/media/{rel}")
-        elif "/media/" in file_path_str:
-            rel = file_path_str.split("/media/", 1)[1]
-            keys_to_set.append(rel)
-            keys_to_set.append(f"/mediajelly/media/{rel}")
-
-        # Intentar incluir claves normalizadas (sin modificar el archivo) para
-        # cubrir el caso en que el archivo sea renombrado por el flujo normalizador
-        try:
-            parent = Path(file_path_str).parent
-            stem = Path(file_path_str).stem
-            ext = Path(file_path_str).suffix
-            norm_stem = _clean_filename_formatting(_normalize_season_episode_format(_remove_fansub_prefixes(stem)))
-            norm_abs = str(parent / f"{norm_stem}{ext}")
-            keys_to_set.append(norm_abs)
-            if "/mediajelly/media/" in norm_abs:
-                rel_norm = norm_abs.split("/mediajelly/media/", 1)[1]
-                keys_to_set.append(rel_norm)
-                keys_to_set.append(f"/media/{rel_norm}")
-            keys_to_set.append(Path(norm_abs).name)
-        except Exception:
-            pass
-
-        for file_key in keys_to_set:
-            if file_key not in cache:
-                cache[file_key] = {}
-            cache[file_key][str(stream_index)] = language
-        save_cache(cache)
-        log(f"Cacheado idioma en archivo para {file_path_str} (stream {stream_index}): {language}", "SUCCESS")
-        return
-
-    # Usar Redis cache
-    file_hash = get_file_hash(file_path)
-    if not file_hash:
-        return
-
-    cache_key = f"lang:{file_hash}:{stream_index}"
     try:
-        redis_client.setex(cache_key, CACHE_TTL, language)
-        log(f"Cacheado idioma para {file_path} stream {stream_index}: {language}", "SUCCESS")
+        record, _ = register(file_path, require_settled=False)
+        if record is None:
+            return
+        set_stream_language(record.fingerprint, int(stream_index), normalize_lang(language), "whisper")
+        log(f"Idioma guardado para {Path(file_path).name} (stream {stream_index}): {normalize_lang(language)}", "SUCCESS")
     except Exception as e:
-        log(f"Error guardando en cache Redis: {e}", "WARNING")
+        log(f"Error guardando idioma: {e}", "WARNING")
+
+
+def _audio_tags(file_path: Union[str, Path]) -> Dict[int, str]:
+    """Etiquetas de idioma de las pistas de audio del archivo: {índice absoluto: etiqueta}."""
+    result = safe_subprocess_run(
+        ["ffprobe", "-v", "error", "-select_streams", "a",
+         "-show_entries", "stream=index:stream_tags=language", "-of", "json", str(file_path)],
+        capture_output=True, text=True, timeout=30,
+    )
+    tags: Dict[int, str] = {}
+    for s in json.loads(result.stdout).get("streams", []):
+        tags[int(s["index"])] = ((s.get("tags") or {}).get("language") or "und").lower()
+    return tags
+
+
+def retag_if_processed(file_path: Union[str, Path], detected: Dict[int, str]) -> bool:
+    """Si el archivo ya está procesado (done/skipped), escribe en él los idiomas detectados.
+
+    Solo toca los streams que están como 'und' en el archivo y cuyo idioma detectado no es 'und'.
+    Tras reescribir, traslada el estado a la huella nueva.
+    """
+    try:
+        record = get_by_path(file_path)
+        if record is None or record.status not in ("done", "skipped"):
+            return False
+        in_file = _audio_tags(file_path)
+        to_write = {
+            idx: lang for idx, lang in detected.items()
+            if lang and lang != "und" and in_file.get(idx, "und") in ("und", "unknown", "zxx", "")
+        }
+        if not to_write:
+            return False
+        if has_retag_failure(record.fingerprint):
+            log(f"Re-etiquetado ya falló antes para {Path(file_path).name}; no se reintenta", "SKIP")
+            return False
+        if not retag_audio(Path(file_path), to_write):
+            record_retag_failure(record.fingerprint, mediajelly_retag.ULTIMO_ERROR or "re-etiquetado fallido")
+            return False
+        record_rewrite(record.fingerprint, file_path)
+        log(f"Etiqueta de idioma escrita en {Path(file_path).name}: {to_write}", "SUCCESS")
+        return True
+    except Exception as e:
+        log(f"Error re-etiquetando {file_path}: {e}", "WARNING")
+        return False
 
 
 # ============================================================================
@@ -653,6 +560,7 @@ def get_streams_needing_detection(file_path: Union[str, Path]) -> List[Tuple[int
 
         streams_to_detect = []
         audio_index = 0
+        duration = None
 
         for stream in streams:
             if stream.get("codec_type") == "audio":
@@ -667,8 +575,9 @@ def get_streams_needing_detection(file_path: Union[str, Path]) -> List[Tuple[int
                     absolute_index = stream.get("index", audio_index)
                     codec_name = stream.get("codec_name", "unknown")
 
-                    # Obtener duración del archivo
-                    duration = get_file_duration(file_path)
+                    # Duración del archivo: un solo ffprobe aunque haya varias pistas sin idioma
+                    if duration is None:
+                        duration = get_file_duration(file_path)
 
                     streams_to_detect.append((absolute_index, codec_name, duration))
                     log(f"  Stream {absolute_index} (audio #{audio_index}): {codec_name} - necesita detección", "INFO")
@@ -1038,9 +947,11 @@ def validate_media_paths() -> bool:
 
 def scan_files_needing_detection() -> List[Dict[str, Any]]:
     """
-    Escanea archivos pendientes de procesamiento y detecta cuáles necesitan análisis de idioma.
+    Escanea archivos pendientes y terminados y detecta cuáles necesitan análisis de idioma.
 
-    Lee el archivo de pendientes y verifica si cada archivo tiene streams de audio sin etiqueta de idioma.
+    Revisa los pendientes y los done/skipped (sin re-etiquetado fallido ni un
+    intento de Whisper sin resultado en los últimos LANGUAGE_RETRY_DAYS días)
+    y se queda con los que tienen pistas de audio sin etiqueta de idioma.
 
     Returns:
         List[Dict[str, Any]]: Lista de diccionarios con información de archivos a analizar.
@@ -1064,20 +975,37 @@ def scan_files_needing_detection() -> List[Dict[str, Any]]:
         log(f"Traceback: {traceback.format_exc()}", "ERROR")
         return files_to_analyze
 
-    log(f"Encontrados {len(pending_paths)} archivos pendientes", "INFO")
+    # Terminados (done/skipped): se revisan para escribir en el archivo los idiomas
+    # que sigan como und (detectados ahora o importados por la migración)
+    try:
+        pending_set = set(pending_paths)
+        processed_paths = [r.path for r in list_language_candidates() if r.path not in pending_set]
+    except Exception as e:
+        log(f"Error leyendo archivos terminados desde DB: {e}", "ERROR")
+        processed_paths = []
 
-    # Procesar cada archivo pendiente
-    for file_path_str in pending_paths:
+    log(
+        f"Encontrados {len(pending_paths)} archivos pendientes y {len(processed_paths)} terminados por revisar",
+        "INFO",
+    )
+    processed_set = set(processed_paths)
+    processed_tagged = 0
+
+    # Procesar cada archivo pendiente o terminado
+    for file_path_str in pending_paths + processed_paths:
         file_path = Path(file_path_str)
+        is_processed = file_path_str in processed_set
 
         # Verificar que el archivo existe
         if not file_path.exists():
-            log(f"Archivo pendiente no existe: {file_path}", "WARNING")
+            if not is_processed:
+                log(f"Archivo pendiente no existe: {file_path}", "WARNING")
             continue
 
         # Verificar que es un archivo de video
         if not file_path.suffix.lower() in [".mkv", ".mp4", ".avi", ".m4v", ".mov"]:
-            log(f"Archivo pendiente no es video: {file_path}", "WARNING")
+            if not is_processed:
+                log(f"Archivo pendiente no es video: {file_path}", "WARNING")
             continue
 
         # CORRECCIÓN: Usar ruta absoluta para get_streams_needing_detection
@@ -1098,8 +1026,13 @@ def scan_files_needing_detection() -> List[Dict[str, Any]]:
                 {"absolute_path": absolute_path, "relative_path": relative_path, "streams": streams}
             )
             log(f"{file_path.name}: {len(streams)} stream(s) sin idioma", "INFO")
+        elif is_processed:
+            processed_tagged += 1
         else:
             log(f"{file_path.name}: ya tiene etiquetas de idioma", "SKIP")
+
+    if processed_tagged:
+        log(f"{processed_tagged} archivo(s) terminados ya tienen etiquetas de idioma", "SKIP")
 
     return files_to_analyze
 
@@ -1142,6 +1075,9 @@ def process_files(files_to_analyze: List[Dict[str, Any]], cache: Dict[str, Any])
         if absolute_path not in cache:
             cache[absolute_path] = {}
 
+        detected_in_file: Dict[int, str] = dict(file_info.get("known") or {})
+        undetected = False
+
         # Analizar cada stream
         for stream_index, codec, duration in streams:
             log(f"\n🎙️ Analizando stream {stream_index} ({codec}, {duration:.1f}s)...", "DETECT")
@@ -1154,21 +1090,30 @@ def process_files(files_to_analyze: List[Dict[str, Any]], cache: Dict[str, Any])
             else:
                 detected_lang = detect_language_with_multiple_samples(model, absolute_path, stream_index, duration)
                 if not detected_lang:
-                    # Sin cachear: se reintenta en la próxima corrida
+                    # Sin guardar: un pendiente se reintenta en la próxima corrida;
+                    # uno terminado espera LANGUAGE_RETRY_DAYS días (ver abajo)
                     log(f"Stream {stream_index}: idioma no detectado", "WARNING")
+                    undetected = True
                     continue
                 set_cached_language(absolute_path, stream_index, detected_lang)
                 log(f"Stream {stream_index}: {detected_lang}", "SUCCESS")
 
-            # Mantener compatibilidad con cache de archivo
+            detected_in_file[stream_index] = normalize_lang(detected_lang)
+            # Compatibilidad: la fuente de verdad es la BD; el dict solo refleja la corrida
             cache[absolute_path][str(stream_index)] = detected_lang
 
-        # Guardar caché cada 5 archivos
-        if idx % 5 == 0:
-            save_cache(cache)
+        # Terminado con alguna pista sin detectar: no se vuelve a pasar por Whisper en cada ciclo
+        if undetected:
+            try:
+                record = get_by_path(absolute_path)
+                if record is not None and record.status in ("done", "skipped"):
+                    record_language_attempt(record.fingerprint)
+            except Exception as e:
+                log(f"Error anotando el intento de detección de {absolute_path}: {e}", "WARNING")
 
-    # Guardar caché final
-    save_cache(cache)
+        # Si el archivo ya está procesado, escribir la etiqueta de inmediato
+        if detected_in_file:
+            retag_if_processed(absolute_path, detected_in_file)
 
     return cache
 
@@ -1180,15 +1125,18 @@ def main():
         log("MEDIAJELLY LANGUAGE DETECTOR", "INFO")
         log("=" * 80 + "\n", "INFO")
 
+        if migration_pending():
+            log(MIGRATION_PENDING_MESSAGE, "ERROR")
+            return
+
         # Ajustar nombres en pending antes de analizar (normalizar nomenclatura)
         try:
             adjust_pending_names()
         except Exception as _e:
             log(f"Advertencia: fallo ajustando nombres en pending: {_e}", "WARNING")
 
-        # Cargar caché existente
-        cache = load_cache()
-        log(f"Caché cargado: {len(cache)} archivos previamente analizados", "INFO")
+        # Los idiomas viven en la BD por huella; language_cache.json solo lo lee la migración
+        cache: Dict[str, Any] = {}
 
         # Escanear archivos
         files_to_analyze = scan_files_needing_detection()
@@ -1199,20 +1147,23 @@ def main():
             absolute_path = file_info["absolute_path"]
             streams = file_info["streams"]
 
-            # Verificar si todos los streams ya están en caché
-            if absolute_path in cache:
-                pending_streams = [s for s in streams if str(s[0]) not in cache[absolute_path]]
-
-                if pending_streams:
-                    files_pending.append(
-                        {
-                            "absolute_path": absolute_path,
-                            "relative_path": file_info["relative_path"],
-                            "streams": pending_streams,
-                        }
-                    )
-            else:
-                files_pending.append(file_info)
+            # Verificar qué streams ya tienen idioma guardado en la BD (por huella)
+            known = {s[0]: get_cached_language(absolute_path, s[0]) for s in streams}
+            pending_streams = [s for s in streams if known[s[0]] is None]
+            already = {i: l for i, l in known.items() if l}
+            if pending_streams:
+                # Un solo remux por archivo: los idiomas conocidos viajan a process_files
+                files_pending.append(
+                    {
+                        "absolute_path": absolute_path,
+                        "relative_path": file_info["relative_path"],
+                        "streams": pending_streams,
+                        "known": already,
+                    }
+                )
+            elif already:
+                # Idiomas ya detectados antes (p. ej. antes de un renombrado): escribirlos si el archivo está procesado
+                retag_if_processed(absolute_path, already)
 
         if files_pending:
             log(f"Archivos pendientes de análisis: {len(files_pending)}", "INFO")
