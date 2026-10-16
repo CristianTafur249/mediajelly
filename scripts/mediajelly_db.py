@@ -17,14 +17,31 @@ Incluye reintentos automáticos ante bloqueos de base de datos.
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import threading
 import time
+from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Set, Tuple
 from functools import wraps
 
+try:
+    from mediajelly_identity import fingerprint, is_settled
+except ImportError:  # importado como paquete (scripts.mediajelly_db)
+    from .mediajelly_identity import fingerprint, is_settled
+
 DB_LOCK = threading.Lock()
+MIGRATION_PENDING_MESSAGE = "Migración pendiente: ejecute mediajelly_migrate.py --apply"
+SCHEMA_VERSION = 2
+MAX_ATTEMPTS = 3
+FAILURE_WINDOW_HOURS = 24
+# Días de espera antes de volver a pasar por Whisper un archivo terminado
+# cuyo idioma no se pudo detectar
+LANGUAGE_RETRY_DAYS = 7
+
+logger = logging.getLogger(__name__)
 
 
 def retry_on_locked(max_retries=5, delay=1, backoff=2):
@@ -120,8 +137,84 @@ def init_db() -> None:
                 )
                 """
             )
-        _bootstrap_from_legacy_files(conn)
+            _create_media_state_schema(conn)
         conn.close()
+
+
+def _create_media_state_schema(conn: sqlite3.Connection) -> None:
+    """Tablas del estado de medios identificado por huella (esquema v2)."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS media_files (
+            fingerprint TEXT PRIMARY KEY,
+            path TEXT UNIQUE NOT NULL,
+            status TEXT NOT NULL,
+            attempts INTEGER DEFAULT 0,
+            first_failed_at TEXT,
+            last_error TEXT,
+            failure_type TEXT,
+            derived_from TEXT,
+            missing_since TEXT,
+            status_before_missing TEXT,
+            created_at TEXT,
+            updated_at TEXT
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_media_files_status ON media_files(status)")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS stream_languages (
+            fingerprint TEXT NOT NULL,
+            stream_index INTEGER NOT NULL,
+            lang TEXT NOT NULL,
+            source TEXT,
+            PRIMARY KEY (fingerprint, stream_index)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS retag_failures (
+            fingerprint TEXT PRIMARY KEY,
+            failed_at TEXT,
+            error TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS subtitle_queue (
+            fingerprint TEXT PRIMARY KEY,
+            added_at TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS fingerprint_cache (
+            path TEXT PRIMARY KEY,
+            size INTEGER NOT NULL,
+            mtime_ns INTEGER NOT NULL,
+            fingerprint TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS language_attempts (
+            fingerprint TEXT PRIMARY KEY,
+            attempted_at TEXT
+        )
+        """
+    )
+    conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
+    conn.execute("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)")
+    row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
+    if row[0] is None:
+        conn.execute("INSERT INTO schema_version(version) VALUES (?)", (SCHEMA_VERSION,))
+    elif row[0] < SCHEMA_VERSION:
+        conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
 
 
 @retry_on_locked()
@@ -304,83 +397,82 @@ def _bootstrap_from_legacy_files(conn: sqlite3.Connection) -> None:
         pass
 
 
-@retry_on_locked()
+def _register_for_wrapper(path) -> Optional[MediaRecord]:
+    """Registra la ruta sin exigir que esté asentada; None si no existe o no se puede leer."""
+    rec, _event = register(path, require_settled=False)
+    if rec is None:
+        logger.warning("No se pudo registrar %s (no existe o no se puede leer)", path)
+    return rec
+
+
 def mark_completed(path, label: Optional[str] = None) -> None:
-    """Marca un archivo como completado (INSERT/REPLACE)."""
-    init_db()
-    path_s = str(path)
-    with DB_LOCK:
-        conn = _get_conn()
-        with conn:
-            conn.execute(
-                "REPLACE INTO completed_files(path, label, completed_at) VALUES (?, ?, datetime('now'))",
-                (path_s, label),
-            )
-        conn.close()
+    """Marca un archivo como completado (por huella, sobrevive a renombrados)."""
+    rec = _register_for_wrapper(path)
+    if rec is not None:
+        set_status(rec.fingerprint, "done")
 
 
-@retry_on_locked()
 def is_completed(path) -> bool:
-    """Devuelve True si el path está en completed_files."""
-    init_db()
-    path_s = str(path)
-    with DB_LOCK:
-        conn = _get_conn()
-        cur = conn.execute("SELECT 1 FROM completed_files WHERE path = ? LIMIT 1", (path_s,))
-        row = cur.fetchone()
-        conn.close()
-    return row is not None
+    """Devuelve True si el archivo está en estado done o skipped."""
+    rec = get_by_path(path)
+    return rec is not None and rec.status in ("done", "skipped")
 
 
-@retry_on_locked()
 def add_pending(path, label: Optional[str] = None) -> None:
-    """Añade o reemplaza un path en pending_files."""
-    init_db()
-    path_s = str(path)
-    with DB_LOCK:
-        conn = _get_conn()
-        with conn:
-            conn.execute(
-                "REPLACE INTO pending_files(path, label, added_at) VALUES (?, ?, datetime('now'))",
-                (path_s, label),
-            )
-        conn.close()
+    """Registra un archivo y lo deja en pending.
+
+    Si el archivo (o el contenido del que es renombrado o duplicado) ya está
+    done/skipped/failed, conserva ese estado en cualquier evento para no
+    reintroducir el reprocesado.
+    """
+    rec, _event = register(path, require_settled=False)
+    if rec is None:
+        logger.warning("No se pudo registrar %s (no existe o no se puede leer)", path)
+        return
+    if rec.status in ("done", "skipped", "failed"):
+        return
+    set_status(rec.fingerprint, "pending")
 
 
 @retry_on_locked()
 def remove_pending(path) -> None:
-    """Elimina un path de pending_files."""
+    """Saca una ruta de pendientes.
+
+    Si no existe, la fila pasa a missing; si existe y estaba pending, pasa a
+    skipped; en otros estados no cambia nada.
+    """
+    exists = Path(str(path)).exists()
     init_db()
-    path_s = str(path)
     with DB_LOCK:
         conn = _get_conn()
         with conn:
-            conn.execute("DELETE FROM pending_files WHERE path = ?", (path_s,))
+            if exists:
+                conn.execute(
+                    "UPDATE media_files SET status = 'skipped', updated_at = datetime('now') "
+                    "WHERE path = ? AND status = 'pending'",
+                    (str(path),),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE media_files
+                    SET status_before_missing = status, status = 'missing',
+                        missing_since = datetime('now'), updated_at = datetime('now')
+                    WHERE path = ? AND status != 'missing'
+                    """,
+                    (str(path),),
+                )
         conn.close()
 
 
-@retry_on_locked()
 def get_pending_files() -> List[Path]:
-    """Devuelve la lista de paths pendientes como objetos Path."""
-    init_db()
-    with DB_LOCK:
-        conn = _get_conn()
-        cur = conn.execute("SELECT path FROM pending_files ORDER BY added_at ASC")
-        rows = cur.fetchall()
-        conn.close()
-    return [Path(r["path"]) for r in rows]
+    """Devuelve las rutas pendientes (ordenadas por created_at) como objetos Path."""
+    return [Path(r.path) for r in list_by_status("pending")]
 
 
-@retry_on_locked()
 def get_all_completed_files() -> List[Path]:
-    """Devuelve todos los paths marcados como completados."""
-    init_db()
-    with DB_LOCK:
-        conn = _get_conn()
-        cur = conn.execute("SELECT path FROM completed_files ORDER BY completed_at ASC")
-        rows = cur.fetchall()
-        conn.close()
-    return [Path(r["path"]) for r in rows]
+    """Devuelve las rutas completadas u omitidas (done o skipped)."""
+    return [Path(r.path) for r in list_by_status("done", "skipped")]
 
 
 @retry_on_locked()
@@ -413,3 +505,660 @@ def load_progress() -> Dict:
         return json.loads(row["data"])
     except Exception:
         return {}
+
+
+# ---------------------------------------------------------------------------
+# Estado de medios identificado por huella de contenido (esquema v2)
+# ---------------------------------------------------------------------------
+
+_LANG_MAP = {
+    "ja": "jpn",
+    "en": "eng",
+    "es": "spa",
+    "fr": "fre",
+    "de": "ger",
+    "it": "ita",
+    "pt": "por",
+}
+
+_MEDIA_COLUMNS = "fingerprint, path, status, attempts, derived_from"
+
+
+@dataclass
+class MediaRecord:
+    fingerprint: str
+    path: str
+    status: str
+    attempts: int
+    derived_from: Optional[str]
+
+
+def _to_record(row: sqlite3.Row) -> MediaRecord:
+    return MediaRecord(
+        fingerprint=row["fingerprint"],
+        path=row["path"],
+        status=row["status"],
+        attempts=int(row["attempts"] or 0),
+        derived_from=row["derived_from"],
+    )
+
+
+@contextmanager
+def _immediate(conn: sqlite3.Connection):
+    """Transacción BEGIN IMMEDIATE: toma el bloqueo de escritura antes de leer."""
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        yield
+    except BaseException:
+        conn.rollback()
+        raise
+    else:
+        conn.commit()
+
+
+def _fetch_by(conn: sqlite3.Connection, column: str, value: str) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        f"SELECT {_MEDIA_COLUMNS}, status_before_missing FROM media_files WHERE {column} = ?",
+        (value,),
+    ).fetchone()
+
+
+def _fetch_record(conn: sqlite3.Connection, fp: str) -> Optional[MediaRecord]:
+    row = _fetch_by(conn, "fingerprint", fp)
+    return _to_record(row) if row else None
+
+
+def _delete_fp(conn: sqlite3.Connection, fp: str) -> None:
+    """Borra una huella y todo lo que cuelga de ella."""
+    conn.execute("DELETE FROM media_files WHERE fingerprint = ?", (fp,))
+    conn.execute("DELETE FROM stream_languages WHERE fingerprint = ?", (fp,))
+    conn.execute("DELETE FROM retag_failures WHERE fingerprint = ?", (fp,))
+    conn.execute("DELETE FROM subtitle_queue WHERE fingerprint = ?", (fp,))
+    conn.execute("DELETE FROM language_attempts WHERE fingerprint = ?", (fp,))
+
+
+def _move_fp(conn: sqlite3.Connection, old_fp: str, new_fp: str) -> None:
+    """Cambia la huella de una fila conservando idiomas y cola de subtítulos."""
+    conn.execute(
+        "UPDATE media_files SET fingerprint = ?, updated_at = datetime('now') WHERE fingerprint = ?",
+        (new_fp, old_fp),
+    )
+    conn.execute("UPDATE OR REPLACE stream_languages SET fingerprint = ? WHERE fingerprint = ?", (new_fp, old_fp))
+    conn.execute("UPDATE OR REPLACE subtitle_queue SET fingerprint = ? WHERE fingerprint = ?", (new_fp, old_fp))
+    conn.execute("UPDATE OR REPLACE language_attempts SET fingerprint = ? WHERE fingerprint = ?", (new_fp, old_fp))
+
+
+def _clear_missing(conn: sqlite3.Connection, fp: str) -> None:
+    """Si la fila estaba `missing`, recupera su estado previo."""
+    conn.execute(
+        """
+        UPDATE media_files
+        SET status = COALESCE(status_before_missing, 'pending'),
+            missing_since = NULL,
+            status_before_missing = NULL,
+            updated_at = datetime('now')
+        WHERE fingerprint = ? AND (status = 'missing' OR missing_since IS NOT NULL)
+        """,
+        (fp,),
+    )
+
+
+def _insert_pending(conn: sqlite3.Connection, fp: str, path_s: str, derived_from: Optional[str] = None) -> None:
+    conn.execute(
+        """
+        INSERT INTO media_files(fingerprint, path, status, attempts, derived_from, created_at, updated_at)
+        VALUES (?, ?, 'pending', 0, ?, datetime('now'), datetime('now'))
+        """,
+        (fp, path_s, derived_from),
+    )
+
+
+def _cached_fingerprint(path: Path, st) -> str:
+    """Huella desde fingerprint_cache si tamaño y mtime coinciden; si no, la calcula."""
+    with DB_LOCK:
+        conn = _get_conn()
+        row = conn.execute(
+            "SELECT size, mtime_ns, fingerprint FROM fingerprint_cache WHERE path = ?",
+            (str(path),),
+        ).fetchone()
+        conn.close()
+    if row and row["size"] == st.st_size and row["mtime_ns"] == st.st_mtime_ns:
+        return row["fingerprint"]
+    return fingerprint(path)
+
+
+def _store_cache(conn: sqlite3.Connection, path_s: str, st, fp: str) -> None:
+    conn.execute(
+        "REPLACE INTO fingerprint_cache(path, size, mtime_ns, fingerprint) VALUES (?, ?, ?, ?)",
+        (path_s, st.st_size, st.st_mtime_ns, fp),
+    )
+
+
+def _register_locked(conn: sqlite3.Connection, path_s: str, fp: str) -> Tuple[Optional[MediaRecord], str]:
+    by_fp = _fetch_by(conn, "fingerprint", fp)
+    by_path = _fetch_by(conn, "path", path_s)
+
+    if by_fp is not None:
+        old_path = by_fp["path"]
+        if old_path == path_s:
+            _clear_missing(conn, fp)
+            return _fetch_record(conn, fp), "unchanged"
+        if Path(old_path).exists():
+            logger.warning(
+                f"⚠️ Contenido duplicado: {path_s} es igual a {old_path}; se mantiene el registro original"
+            )
+            return _to_record(by_fp), "duplicate"
+        if by_path is not None:
+            _delete_fp(conn, by_path["fingerprint"])
+        conn.execute(
+            "UPDATE media_files SET path = ?, updated_at = datetime('now') WHERE fingerprint = ?",
+            (path_s, fp),
+        )
+        conn.execute("DELETE FROM fingerprint_cache WHERE path = ?", (old_path,))
+        _clear_missing(conn, fp)
+        logger.info(f"Renombrado: {Path(old_path).name} → {Path(path_s).name}")
+        return _fetch_record(conn, fp), "renamed"
+
+    if by_path is not None:
+        if by_path["status"] == "processing":
+            _move_fp(conn, by_path["fingerprint"], fp)
+            return _fetch_record(conn, fp), "adopted"
+        _delete_fp(conn, by_path["fingerprint"])
+        _insert_pending(conn, fp, path_s)
+        return _fetch_record(conn, fp), "replaced"
+
+    _insert_pending(conn, fp, path_s)
+    return _fetch_record(conn, fp), "new"
+
+
+@retry_on_locked()
+def register(path, require_settled: bool = True) -> Tuple[Optional[MediaRecord], str]:
+    """Registra un video por su huella.
+
+    Devuelve (registro, evento) con evento en "new", "renamed", "unchanged",
+    "duplicate", "unsettled", "adopted" o "replaced".
+    """
+    init_db()
+    p = Path(path)
+    path_s = str(p)
+    if require_settled and not is_settled(p):
+        return None, "unsettled"
+    try:
+        st = p.stat()
+        fp = _cached_fingerprint(p, st)
+    except OSError:
+        return None, "unsettled"
+
+    with DB_LOCK:
+        conn = _get_conn()
+        try:
+            for _ in range(5):
+                try:
+                    with _immediate(conn):
+                        _store_cache(conn, path_s, st, fp)
+                        return _register_locked(conn, path_s, fp)
+                except sqlite3.IntegrityError:
+                    # Otro proceso insertó la misma huella o ruta primero: se vuelve a leer.
+                    continue
+            raise sqlite3.IntegrityError(f"No se pudo registrar {path_s} tras varios intentos")
+        finally:
+            conn.close()
+
+
+@retry_on_locked()
+def get_by_path(path) -> Optional[MediaRecord]:
+    """Devuelve el registro de una ruta, o None si no está registrada."""
+    init_db()
+    with DB_LOCK:
+        conn = _get_conn()
+        row = _fetch_by(conn, "path", str(path))
+        conn.close()
+    return _to_record(row) if row else None
+
+
+@retry_on_locked()
+def list_by_status(*statuses: str) -> List[MediaRecord]:
+    """Devuelve los registros con alguno de los estados indicados (al menos uno)."""
+    if not statuses:
+        raise ValueError("list_by_status necesita al menos un estado")
+    init_db()
+    marks = ", ".join("?" for _ in statuses)
+    with DB_LOCK:
+        conn = _get_conn()
+        rows = conn.execute(
+            f"SELECT {_MEDIA_COLUMNS} FROM media_files WHERE status IN ({marks}) ORDER BY created_at ASC, path ASC",
+            statuses,
+        ).fetchall()
+        conn.close()
+    return [_to_record(r) for r in rows]
+
+
+@retry_on_locked()
+def set_status(fp: str, status: str) -> None:
+    """Fija el estado de una huella; "done" y "skipped" reinician el conteo de fallos."""
+    init_db()
+    with DB_LOCK:
+        conn = _get_conn()
+        with conn:
+            if status in ("done", "skipped"):
+                conn.execute(
+                    """
+                    UPDATE media_files
+                    SET status = ?, attempts = 0, first_failed_at = NULL, failure_type = NULL,
+                        updated_at = datetime('now')
+                    WHERE fingerprint = ?
+                    """,
+                    (status, fp),
+                )
+            else:
+                conn.execute(
+                    "UPDATE media_files SET status = ?, updated_at = datetime('now') WHERE fingerprint = ?",
+                    (status, fp),
+                )
+        conn.close()
+
+
+@retry_on_locked()
+def record_failure(fp: str, error: str, resource: bool) -> str:
+    """Anota un fallo y devuelve el estado resultante ("pending" o "failed").
+
+    Los fallos de recursos no cuentan como intento. Un fallo de contenido pasa
+    a "failed" al llegar a MAX_ATTEMPTS o tras FAILURE_WINDOW_HOURS desde el primero.
+    Una fila ya en "failed" no cambia y devuelve "failed".
+    Devuelve "" si la huella no está registrada.
+    """
+    init_db()
+    with DB_LOCK:
+        conn = _get_conn()
+        try:
+            with _immediate(conn):
+                current = _fetch_by(conn, "fingerprint", fp)
+                if current is None:
+                    logger.warning(f"⚠️ Fallo de una huella no registrada: {fp}")
+                    return ""
+                if current["status"] == "failed":
+                    return "failed"
+                if resource:
+                    conn.execute(
+                        """
+                        UPDATE media_files
+                        SET status = 'pending', failure_type = 'resource', last_error = ?,
+                            updated_at = datetime('now')
+                        WHERE fingerprint = ?
+                        """,
+                        (error, fp),
+                    )
+                    return "pending"
+                conn.execute(
+                    """
+                    UPDATE media_files
+                    SET attempts = COALESCE(attempts, 0) + 1,
+                        first_failed_at = COALESCE(first_failed_at, datetime('now')),
+                        failure_type = 'content', last_error = ?
+                    WHERE fingerprint = ?
+                    """,
+                    (error, fp),
+                )
+                row = conn.execute(
+                    "SELECT attempts, first_failed_at <= datetime('now', ?) AS expired FROM media_files WHERE fingerprint = ?",
+                    (f"-{FAILURE_WINDOW_HOURS} hours", fp),
+                ).fetchone()
+                status = "failed" if row["attempts"] >= MAX_ATTEMPTS or row["expired"] else "pending"
+                conn.execute(
+                    "UPDATE media_files SET status = ?, updated_at = datetime('now') WHERE fingerprint = ?",
+                    (status, fp),
+                )
+                if status == "failed":
+                    logger.warning(f"⚠️ En cuarentena tras {row['attempts']} fallo(s): {fp}")
+                return status
+        finally:
+            conn.close()
+
+
+@retry_on_locked()
+def record_rewrite(old_fp: str, new_path, carry_languages: bool = True) -> MediaRecord:
+    """Pasa el estado de old_fp a la huella del archivo reescrito en new_path.
+
+    Con carry_languages=False no se trasladan los idiomas por stream: tras una
+    recompresión los índices de pista del original no valen para la salida
+    (las etiquetas ya van escritas en el archivo).
+    """
+    init_db()
+    p = Path(new_path)
+    path_s = str(p)
+    st = p.stat()
+    new_fp = _cached_fingerprint(p, st)
+
+    with DB_LOCK:
+        conn = _get_conn()
+        try:
+            with _immediate(conn):
+                _store_cache(conn, path_s, st, new_fp)
+                old = _fetch_by(conn, "fingerprint", old_fp)
+                if old is None:
+                    logger.warning(f"⚠️ Reescritura de una huella no registrada ({old_fp}); se registra {path_s}")
+                    by_path = _fetch_by(conn, "path", path_s)
+                    if by_path is not None and by_path["fingerprint"] != new_fp:
+                        _delete_fp(conn, by_path["fingerprint"])
+                    if _fetch_by(conn, "fingerprint", new_fp) is None:
+                        _insert_pending(conn, new_fp, path_s, derived_from=old_fp)
+                    else:
+                        conn.execute(
+                            "UPDATE media_files SET path = ?, updated_at = datetime('now') WHERE fingerprint = ?",
+                            (path_s, new_fp),
+                        )
+                    return _fetch_record(conn, new_fp)
+
+                old_path = old["path"]
+                if new_fp != old_fp:
+                    if _fetch_by(conn, "fingerprint", new_fp) is not None:
+                        _delete_fp(conn, new_fp)
+                    if not carry_languages:
+                        conn.execute("DELETE FROM stream_languages WHERE fingerprint = ?", (old_fp,))
+                    _move_fp(conn, old_fp, new_fp)
+                by_path = _fetch_by(conn, "path", path_s)
+                if by_path is not None and by_path["fingerprint"] != new_fp:
+                    _delete_fp(conn, by_path["fingerprint"])
+                conn.execute(
+                    """
+                    UPDATE media_files
+                    SET path = ?, derived_from = CASE WHEN ? THEN ? ELSE derived_from END,
+                        updated_at = datetime('now')
+                    WHERE fingerprint = ?
+                    """,
+                    (path_s, new_fp != old_fp, old_fp, new_fp),
+                )
+                _clear_missing(conn, new_fp)
+                if old_path != path_s:
+                    conn.execute("DELETE FROM fingerprint_cache WHERE path = ?", (old_path,))
+                return _fetch_record(conn, new_fp)
+        finally:
+            conn.close()
+
+
+@retry_on_locked()
+def recover_processing() -> int:
+    """Devuelve a "pending" lo que quedó en "processing" (sin sumar intento)."""
+    init_db()
+    with DB_LOCK:
+        conn = _get_conn()
+        with conn:
+            cur = conn.execute(
+                "UPDATE media_files SET status = 'pending', updated_at = datetime('now') WHERE status = 'processing'"
+            )
+            count = cur.rowcount
+        conn.close()
+    if count:
+        logger.info(f"🔄 Recuperados {count} archivo(s) que quedaron en proceso")
+    return count
+
+
+@retry_on_locked()
+def mark_missing_except(existing_paths: Set[str], roots: Optional[List[str]] = None) -> int:
+    """Marca como "missing" las filas cuya ruta no está en existing_paths.
+
+    Si se indican `roots`, solo se consideran las filas bajo alguna de esas
+    raíces, para no marcar como ausente lo que está en un montaje caído o vacío.
+    """
+    init_db()
+    existing = {str(p) for p in existing_paths}
+    prefixes = None if roots is None else tuple(str(r).rstrip("/") + "/" for r in roots)
+    with DB_LOCK:
+        conn = _get_conn()
+        try:
+            with _immediate(conn):
+                rows = conn.execute(
+                    "SELECT fingerprint, path FROM media_files WHERE status != 'missing'"
+                ).fetchall()
+                gone = [
+                    (r["fingerprint"],)
+                    for r in rows
+                    if r["path"] not in existing and (prefixes is None or r["path"].startswith(prefixes))
+                ]
+                conn.executemany(
+                    """
+                    UPDATE media_files
+                    SET status_before_missing = status, status = 'missing',
+                        missing_since = datetime('now'), updated_at = datetime('now')
+                    WHERE fingerprint = ?
+                    """,
+                    gone,
+                )
+        finally:
+            conn.close()
+    return len(gone)
+
+
+@retry_on_locked()
+def purge_missing(days: int = 30) -> int:
+    """Borra las filas "missing" desde hace al menos `days` días."""
+    init_db()
+    with DB_LOCK:
+        conn = _get_conn()
+        try:
+            with _immediate(conn):
+                rows = conn.execute(
+                    """
+                    SELECT fingerprint, path FROM media_files
+                    WHERE status = 'missing' AND missing_since <= datetime('now', ?)
+                    """,
+                    (f"-{int(days)} days",),
+                ).fetchall()
+                for r in rows:
+                    _delete_fp(conn, r["fingerprint"])
+                    conn.execute("DELETE FROM fingerprint_cache WHERE path = ?", (r["path"],))
+        finally:
+            conn.close()
+    if rows:
+        logger.info(f"🗑️ Purgados {len(rows)} registro(s) ausentes desde hace {days} días o más")
+    return len(rows)
+
+
+def normalize_lang(code: str) -> str:
+    """Normaliza un código de idioma a ISO 639-2 (3 letras); vacío → "und"."""
+    value = (code or "").strip().lower()
+    if not value:
+        return "und"
+    return _LANG_MAP.get(value, value)
+
+
+@retry_on_locked()
+def set_stream_language(fp: str, stream_index: int, lang: str, source: str) -> None:
+    """Guarda el idioma de un stream de audio (normalizado)."""
+    init_db()
+    with DB_LOCK:
+        conn = _get_conn()
+        with conn:
+            conn.execute(
+                "REPLACE INTO stream_languages(fingerprint, stream_index, lang, source) VALUES (?, ?, ?, ?)",
+                (fp, int(stream_index), normalize_lang(lang), source),
+            )
+        conn.close()
+
+
+@retry_on_locked()
+def get_stream_languages(fp: str) -> Dict[int, str]:
+    """Devuelve {índice_de_stream: idioma} de una huella."""
+    init_db()
+    with DB_LOCK:
+        conn = _get_conn()
+        rows = conn.execute(
+            "SELECT stream_index, lang FROM stream_languages WHERE fingerprint = ? ORDER BY stream_index",
+            (fp,),
+        ).fetchall()
+        conn.close()
+    return {int(r["stream_index"]): r["lang"] for r in rows}
+
+
+@retry_on_locked()
+def record_retag_failure(fp: str, error: str) -> None:
+    """Anota que el re-etiquetado de esta huella falló, para no repetir el remux."""
+    init_db()
+    with DB_LOCK:
+        conn = _get_conn()
+        with conn:
+            conn.execute(
+                "REPLACE INTO retag_failures(fingerprint, failed_at, error) VALUES (?, datetime('now'), ?)",
+                (fp, (error or "")[:500]),
+            )
+        conn.close()
+
+
+@retry_on_locked()
+def has_retag_failure(fp: str) -> bool:
+    """True si el re-etiquetado de esta huella ya falló antes."""
+    init_db()
+    with DB_LOCK:
+        conn = _get_conn()
+        row = conn.execute("SELECT 1 FROM retag_failures WHERE fingerprint = ?", (fp,)).fetchone()
+        conn.close()
+    return row is not None
+
+
+@retry_on_locked()
+def record_language_attempt(fp: str) -> None:
+    """Anota que Whisper no pudo detectar algún idioma de esta huella terminada."""
+    init_db()
+    with DB_LOCK:
+        conn = _get_conn()
+        with conn:
+            conn.execute(
+                "REPLACE INTO language_attempts(fingerprint, attempted_at) VALUES (?, datetime('now'))",
+                (fp,),
+            )
+        conn.close()
+
+
+@retry_on_locked()
+def list_language_candidates(retry_days: int = LANGUAGE_RETRY_DAYS) -> List[MediaRecord]:
+    """Registros done/skipped que el detector de idiomas puede revisar.
+
+    Excluye los que ya fallaron al re-etiquetar y los que pasaron por Whisper
+    sin resultado hace menos de retry_days días.
+    """
+    init_db()
+    with DB_LOCK:
+        conn = _get_conn()
+        rows = conn.execute(
+            f"""
+            SELECT {_MEDIA_COLUMNS} FROM media_files m
+            WHERE status IN ('done', 'skipped')
+              AND NOT EXISTS (SELECT 1 FROM retag_failures r WHERE r.fingerprint = m.fingerprint)
+              AND NOT EXISTS (
+                  SELECT 1 FROM language_attempts a
+                  WHERE a.fingerprint = m.fingerprint AND a.attempted_at > datetime('now', ?)
+              )
+            ORDER BY created_at ASC, path ASC
+            """,
+            (f"-{int(retry_days)} days",),
+        ).fetchall()
+        conn.close()
+    return [_to_record(r) for r in rows]
+
+
+@retry_on_locked()
+def get_meta(key: str) -> Optional[str]:
+    """Valor de la tabla meta, o None si no existe."""
+    init_db()
+    with DB_LOCK:
+        conn = _get_conn()
+        row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+        conn.close()
+    return row["value"] if row else None
+
+
+@retry_on_locked()
+def mark_legacy_migrated() -> None:
+    """Deja constancia (con la fecha UTC) de que el estado anterior ya se migró."""
+    init_db()
+    with DB_LOCK:
+        conn = _get_conn()
+        with conn:
+            conn.execute("REPLACE INTO meta(key, value) VALUES ('legacy_migrated', datetime('now'))")
+        conn.close()
+
+
+@retry_on_locked()
+def migration_pending() -> bool:
+    """True si hay historial anterior (completed_files) sin migrar al estado por huella.
+
+    Sin BD o con completed_files vacía (instalación nueva) no hay nada que migrar.
+    """
+    if not _get_db_path().exists():
+        return False
+    init_db()
+    with DB_LOCK:
+        conn = _get_conn()
+        try:
+            if conn.execute("SELECT 1 FROM completed_files LIMIT 1").fetchone() is None:
+                return False
+            return conn.execute("SELECT 1 FROM meta WHERE key = 'legacy_migrated'").fetchone() is None
+        finally:
+            conn.close()
+
+
+@retry_on_locked()
+def replace_subtitle_queue(paths: List[str]) -> None:
+    """Reemplaza la cola de subtítulos; conserva la fecha de los que ya estaban.
+
+    Solo encola rutas ya registradas (el escáner las registra antes de armar la
+    cola); las desconocidas, p. ej. archivos aún en copia, se omiten.
+    """
+    init_db()
+    fps: List[str] = []
+    for path in paths:
+        rec = get_by_path(path)
+        if rec is None:
+            logger.debug(f"Se omite de la cola de subtítulos (no registrado): {path}")
+            continue
+        if rec.fingerprint not in fps:
+            fps.append(rec.fingerprint)
+
+    with DB_LOCK:
+        conn = _get_conn()
+        try:
+            with _immediate(conn):
+                current = {r["fingerprint"] for r in conn.execute("SELECT fingerprint FROM subtitle_queue")}
+                keep = set(fps)
+                conn.executemany(
+                    "DELETE FROM subtitle_queue WHERE fingerprint = ?",
+                    [(fp,) for fp in current - keep],
+                )
+                conn.executemany(
+                    "INSERT OR IGNORE INTO subtitle_queue(fingerprint, added_at) VALUES (?, datetime('now'))",
+                    [(fp,) for fp in fps],
+                )
+        finally:
+            conn.close()
+
+
+@retry_on_locked()
+def get_subtitle_queue() -> List[Path]:
+    """Devuelve las rutas actuales de la cola de subtítulos (sin las ausentes)."""
+    init_db()
+    with DB_LOCK:
+        conn = _get_conn()
+        rows = conn.execute(
+            """
+            SELECT m.path FROM subtitle_queue q
+            JOIN media_files m ON m.fingerprint = q.fingerprint
+            WHERE m.status != 'missing'
+            ORDER BY q.added_at ASC, q.rowid ASC
+            """
+        ).fetchall()
+        conn.close()
+    return [Path(r["path"]) for r in rows]
+
+
+@retry_on_locked()
+def remove_from_subtitle_queue(paths: List[str]) -> None:
+    """Quita rutas de la cola de subtítulos."""
+    init_db()
+    with DB_LOCK:
+        conn = _get_conn()
+        with conn:
+            conn.executemany(
+                "DELETE FROM subtitle_queue WHERE fingerprint IN (SELECT fingerprint FROM media_files WHERE path = ?)",
+                [(str(p),) for p in paths],
+            )
+        conn.close()
