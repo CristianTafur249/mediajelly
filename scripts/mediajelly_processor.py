@@ -15,6 +15,7 @@ import subprocess
 from pathlib import Path
 from datetime import datetime
 from concurrent.futures import ProcessPoolExecutor, as_completed  # Volviendo a ProcessPool
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass, asdict
 from typing import List, Dict, Optional, Tuple, Union, Any
 import signal
@@ -58,6 +59,14 @@ from mediajelly_db import (
     save_progress,
     load_progress,
     get_all_completed_files,
+    register,
+    get_by_path,
+    set_status,
+    record_failure,
+    record_rewrite,
+    recover_processing,
+    migration_pending,
+    MIGRATION_PENDING_MESSAGE,
 )
 try:
     from mediajelly_language_detector import set_cached_language, detect_language_with_whisper_for_processor
@@ -103,6 +112,10 @@ LONG_TIMEOUT = 60     # Para remux/etiquetado rápido
 PROCESSING_COMPLETED_MESSAGE = "Procesamiento completado"
 EXCLUDED_FOLDERS = MediaJellyPaths.EXCLUDED_FOLDERS
 MOVFLAGS_FASTSTART = "+faststart"
+# Marca que el procesador deja en cada .mp4 que produce. "Ya cumple" la exige: un
+# .mp4 recién descargado no la tiene y siempre pasa por ffmpeg (reglas de audio, compresión).
+MARCA_PROCESADO = "MediaJelly"
+MARCA_ARGS = ["-metadata", f"comment={MARCA_PROCESADO}"]
 
 # Piso de memoria libre exigido antes de lanzar ffmpeg. Si no se cumple, el
 # archivo se pospone (no se marca como fallido) para el siguiente ciclo de
@@ -112,8 +125,7 @@ MIN_FREE_MEMORY_GB_CGROUP = 1.0
 
 # Mensajes que identifican un fallo por falta de recursos (OOM/timeout) en vez
 # de un problema real del archivo (códec corrupto, validación, etc.). Estos
-# fallos no deben consumir intentos de la cuarentena de 3 intentos: ver
-# _build_failed_entry / _should_remove_failed_file.
+# fallos no consumen intentos de la cuarentena (record_failure con resource=True).
 RESOURCE_FAILURE_MARKERS = (
     "SIGKILL - posible OOM",
     "terminado por señal",
@@ -299,31 +311,10 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
         # Mejorador de calidad
         self.quality_improver = VideoQualityImprover(self.logger)
 
-        # Caché de idiomas pre-detectados (llenado por mediajelly_language_detector.py)
-        # Determinar ruta del caché, preferir configuración si está disponible
-        cache_file_path = None
-        if get_config:
-            try:
-                config = get_config()
-                cache_file_path = Path(config.paths.cache_file_path)
-            except Exception:
-                cache_file_path = None
-
-        if cache_file_path:
-            # Si no se puede crear el directorio en la ruta de config, usar tmp local
-            try:
-                cache_file_path.parent.mkdir(parents=True, exist_ok=True)
-                self.language_cache_file = cache_file_path
-            except Exception:
-                self.language_cache_file = self.tmp_dir / "language_cache.json"
-        else:
-            self.language_cache_file = self.tmp_dir / "language_cache.json"
-        self.language_cache = self._load_language_cache()
-
         # Modelo Whisper deshabilitado (se usa pre-análisis)
         self.whisper_model = None
         self.whisper_enabled = False
-        self.logger.info("🎙️ Detección de idioma: usando caché pre-analizado")
+        self.logger.info("🎙️ Detección de idioma: usando idiomas guardados en la BD")
 
     def setup_logging(self):
         """Configura logging estructurado con rotación automática"""
@@ -688,10 +679,6 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
 
         files_cleaned = 0
         files_added_to_pending = 0
-        failed_files_path = self.failed_file
-
-        # Carga archivos que han fallado previamente
-        failed_files = self._load_failed_files(failed_files_path)
 
         for compressed_file in compressed_files_found:
             try:
@@ -759,10 +746,10 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
 
                 if original_files:
                     original_file = original_files[0]  # Toma el primero encontrado
-                    original_file_str = str(original_file)
 
-                    # Verifica si este archivo ya falló previamente
-                    if original_file_str in failed_files:
+                    # El estado vive en la BD por huella (no en failed-compression.txt)
+                    original_rec = get_by_path(original_file)
+                    if original_rec is not None and original_rec.status == "failed":
                         self.logger.warning(f"Archivo ya marcado como fallido, omitiendo: {original_file.name}")
                         compressed_file.unlink()  # Elimina el .compressed.mp4 pero NO lo reagrega a pendientes
                         files_cleaned += 1
@@ -774,10 +761,11 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
                     compressed_file.unlink()
                     files_cleaned += 1
 
-                    # SIEMPRE agregar de vuelta a pendientes cuando eliminamos un archivo corrupto
-                    # Esto asegura que el archivo original se reprocese
-                    if original_file_str not in failed_files:
-                        self._add_to_pending(original_file)
+                    # Devolver el original a pendientes para reprocesarlo
+                    # (add_pending conserva done/skipped/failed)
+                    self._add_to_pending(original_file)
+                    after = get_by_path(original_file)
+                    if after is not None and after.status == "pending":
                         files_added_to_pending += 1
                         self.logger.info(
                             f"{EmojiGenerator.success()} Archivo agregado de vuelta a pendientes: {original_file.name}"
@@ -1289,6 +1277,7 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
         ffmpeg_cmd.extend(["-map_metadata", "0"])
 
         # Configuración final
+        ffmpeg_cmd.extend(MARCA_ARGS)
         ffmpeg_cmd.extend(["-movflags", MOVFLAGS_FASTSTART, str(temp_output)])
 
         return ffmpeg_cmd
@@ -1447,6 +1436,7 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
         ffmpeg_cmd.extend(["-map_metadata", "0"])
 
         # Configuración final
+        ffmpeg_cmd.extend(MARCA_ARGS)
         ffmpeg_cmd.extend(["-movflags", MOVFLAGS_FASTSTART, "-avoid_negative_ts", "make_zero", str(temp_output)])
 
         return ffmpeg_cmd
@@ -1562,6 +1552,7 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
         ffmpeg_cmd.extend(["-map_metadata", "0"])
 
         # Final config
+        ffmpeg_cmd.extend(MARCA_ARGS)
         ffmpeg_cmd.extend(["-movflags", MOVFLAGS_FASTSTART, "-avoid_negative_ts", "make_zero", str(temp_output)])
 
         return ffmpeg_cmd
@@ -1627,6 +1618,7 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
 
         ffmpeg_cmd.extend(["-c:a", "aac", "-b:a", "256k", "-ac", "2", "-ar", "48000"])
         ffmpeg_cmd.extend(["-map_metadata", "0"])
+        ffmpeg_cmd.extend(MARCA_ARGS)
         ffmpeg_cmd.extend(["-movflags", MOVFLAGS_FASTSTART, "-avoid_negative_ts", "make_zero", str(temp_output)])
 
         return ffmpeg_cmd
@@ -1776,10 +1768,7 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
         if temp_output.exists():
             temp_output.unlink()
 
-        # Marcar como fallido para evitar reintentos
-        failed_files_path = self.failed_file
-        self._add_to_failed_files(str(file_path), failed_files_path, f"Validación fallida: {validation_msg}")
-
+        # El fallo se anota en la BD desde _update_stats_from_result (record_failure).
         return {
             "compressed": False,
             "renamed": False,
@@ -1814,8 +1803,8 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
             if file_path != final_name and file_path.exists():
                 file_path.unlink()
 
-            # Actualizar pending si cambió extensión
-            self._update_pending_file(str(file_path), str(final_name))
+            # Trasladar el estado a la huella del archivo reescrito
+            self._record_rewrite(final_name)
 
             # Marcar como completado
             self._mark_as_completed(final_name)
@@ -1844,8 +1833,8 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
             if file_path != final_name and file_path.exists():
                 file_path.unlink()  # Eliminar el original si el nombre cambió
 
-            # Actualizar pending si cambió extensión
-            self._update_pending_file(str(file_path), str(final_name))
+            # Trasladar el estado a la huella del archivo reescrito
+            self._record_rewrite(final_name)
 
             # Marcar como completado
             self._mark_as_completed(final_name)
@@ -1885,9 +1874,9 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
         else:
             self.logger.info(f"Archivo original es .mp4, manteniendo: {file_path.name}")
 
-        # Si se comprimió exitosamente y cambió la extensión, actualizar pending-compression.txt
-        if final_name != file_path:
-            self._update_pending_file(str(file_path), str(final_name))
+        # Trasladar el estado a la huella del archivo reescrito (si el original
+        # era .mkv y se borró, la fila pasa a apuntar a final_name)
+        self._record_rewrite(final_name)
 
         # Marcar como completado
         self._mark_as_completed(final_name)
@@ -1911,67 +1900,46 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
             self.logger.info(f"Archivo original eliminado exitosamente: {file_path.name}")
         except Exception as e:
             self.logger.error(f"Error eliminando archivo original {file_path}: {e}")
-            # Marcar como fallido si no se puede eliminar el original
-            failed_files_path = self.failed_file
-            self._add_to_failed_files(str(file_path), failed_files_path, f"Error eliminando original: {e}")
+
+    def _record_rewrite(self, final_name: Path) -> None:
+        """Pasa el estado de la huella original (guardada en compress_single_file)
+        a la del archivo reescrito en final_name.
+
+        No traslada los idiomas por stream: la salida recomprimida puede tener
+        otro orden de pistas y las etiquetas ya van escritas en el archivo."""
+        original_fp = getattr(self, "_original_fp", None)
+        if not original_fp:
+            self.logger.warning(f"{EmojiGenerator.warning_msg()} Sin huella original para {final_name.name}; se registra como nuevo")
+            return
+        try:
+            record_rewrite(original_fp, final_name, carry_languages=False)
+        except Exception as e:
+            self.logger.error(f"Error trasladando el estado a {final_name}: {e}")
 
     def _mark_as_completed(self, final_name: Path):
-        """Marca el archivo como completado en el registro.
+        """Marca el archivo como completado (done) en la BD.
 
-        Se guarda además una etiqueta ligera (el sufijo) en la estructura de
-        `processed_files` para facilitar detecciones de cambios posteriores.
+        Si alguna pista de audio quedó sin idioma detectado, se marca done igual
+        y se avisa: el detector de idiomas analiza los archivos done con und y
+        escribe la etiqueta. Devolverlo a pending haría que se recomprimiera en
+        cada ciclo. `processed_files` solo alimenta el progreso del notificador.
         """
-        # Antes de marcar como completado, verificar que las pistas de audio tengan idioma detectado.
+        undetected_audio = False
         try:
-            has_spanish, audio_indices, sub_indices, audio_languages = self.detect_language_streams(final_name)
-
-            # Determinar si existen pistas de audio sin idioma detectado.
-            undetected_audio = False
-            if audio_languages:
-                for idx, lang in audio_languages.items():
-                    if not lang or str(lang).strip() == "" or str(lang).lower() == "und":
-                        undetected_audio = True
-                        break
-
-            if undetected_audio:
-                # No marcar como completado: agregar a pending para re-intento de detección
-                try:
-                    from mediajelly_db import add_pending
-
-                    add_pending(str(final_name), label=final_name.suffix.lower())
-                    self.logger.warning(f"{EmojiGenerator.warning_msg()} Archivo sin idioma detectado, movido a pending: {final_name.name}")
-                    # Registrar en logger específico y en estadísticas
-                    try:
-                        self.no_spanish_logger.info(str(final_name))
-                    except Exception:
-                        pass
-                    self.processed_files[str(final_name)] = {
-                        "status": "no_language",
-                        "timestamp": datetime.now().isoformat(),
-                        "label": final_name.suffix.lower(),
-                    }
-                    try:
-                        self.stats.no_spanish.append(str(final_name))
-                    except Exception:
-                        pass
-                except Exception as e:
-                    self.logger.error(f"Error agregando a pending tras falta de idioma: {e}")
-                return
-
+            _has_spanish, _audio_indices, _sub_indices, audio_languages = self.detect_language_streams(final_name)
+            undetected_audio = any(
+                not lang or str(lang).strip() == "" or str(lang).lower() == "und"
+                for lang in (audio_languages or {}).values()
+            )
         except Exception as e:
-            # En caso de error al detectar, prevenir marcar completado y dejar en pending
+            undetected_audio = True
             self.logger.warning(f"{EmojiGenerator.warning_msg()} Error verificando idioma antes de marcar completado: {e}")
-            try:
-                from mediajelly_db import add_pending
 
-                add_pending(str(final_name), label=final_name.suffix.lower())
-            except Exception:
-                pass
-            self.processed_files[str(final_name)] = {
-                "status": "no_language",
-                "timestamp": datetime.now().isoformat(),
-                "label": final_name.suffix.lower(),
-            }
+        if undetected_audio:
+            self.logger.warning(
+                f"{EmojiGenerator.warning_msg()} Archivo sin idioma detectado, se marca completado; "
+                f"el detector de idiomas lo re-etiquetará: {final_name.name}"
+            )
             try:
                 self.no_spanish_logger.info(str(final_name))
             except Exception:
@@ -1980,16 +1948,9 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
                 self.stats.no_spanish.append(str(final_name))
             except Exception:
                 pass
-            return
 
-        # Si llegamos aquí, todo ok: marcar completado
         mark_completed(str(final_name))
 
-        # Mantener el archivo legacy para compatibilidad con utilidades antiguas.
-        with open(self.completed_file, "a") as f:
-            f.write(f"{final_name}\n")
-
-        # Actualizar memoria si ya está cargada
         self.processed_files[str(final_name)] = {
             "status": "success",
             "timestamp": datetime.now().isoformat(),
@@ -2034,8 +1995,7 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
             temp_output.unlink()
 
         # NOTA: No marcar como fallido aquí para permitir fallbacks (CPU / SAFE).
-        # El marcado persistente a failed-compression.txt se realiza sólo si
-        # todos los fallbacks fallan (_handle_fallback_logic se encarga de ello).
+        # El fallo se anota en la BD desde _update_stats_from_result.
 
         return {
             "compressed": False,
@@ -2084,10 +2044,6 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
         if temp_output and temp_output.exists():
             temp_output.unlink()
 
-        # Marcar como fallido
-        failed_files_path = self.failed_file
-        self._add_to_failed_files(str(file_path), failed_files_path, error_msg)
-
         self.logger.error(error_msg)
 
     def _handle_unexpected_error(self, result: Dict, file_path: Path, exception: Exception, temp_output: Optional[Path]) -> None:
@@ -2107,10 +2063,6 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
         if temp_output and temp_output.exists():
             temp_output.unlink()
 
-        # Marcar como fallido
-        failed_files_path = self.failed_file
-        self._add_to_failed_files(str(file_path), failed_files_path, error_msg)
-
         self.logger.error(error_msg)
         self.logger.error(f"Traceback completo: {exception}", exc_info=True)
 
@@ -2125,6 +2077,57 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
             self.logger.info(f"  Pistas de subtítulos detectadas: {', '.join(map(str, sub_indices))}")
         else:
             self.logger.info("  No se detectaron pistas de subtítulos")
+
+    def _fingerprint_for(self, file_path: Path) -> Optional[str]:
+        """Huella del archivo en la BD; si no está registrado, lo registra."""
+        try:
+            rec = get_by_path(file_path)
+            if rec is None:
+                rec, _event = register(file_path, require_settled=False)
+            return rec.fingerprint if rec else None
+        except Exception as e:
+            self.logger.error(f"Error obteniendo la huella de {file_path}: {e}")
+            return None
+
+    def _already_conforms(self, file_path: Path) -> bool:
+        """True si el archivo ya cumple las reglas y no hace falta ffmpeg:
+        .mp4, códec eficiente, bitrate < 9000 kbps, no UHD y todas las pistas
+        de audio con idioma detectado (es decir, hoy solo se remuxaría)."""
+        if file_path.suffix.lower() != ".mp4":
+            return False
+        if self._get_video_codec(file_path) not in {"h264", "hevc", "av1"}:
+            return False
+        bitrate_info = self._get_video_bitrate(file_path)
+        if not bitrate_info or bitrate_info.get("bitrate_kbps") is None:
+            return False
+        if bitrate_info["bitrate_kbps"] >= 9000:
+            return False
+        # Sin resolución (ffprobe falló) no se sabe si es UHD: no "cumple".
+        # El 4K/UHD siempre se recodifica a 1080p: nunca "cumple".
+        resolution = self._get_video_resolution(file_path)
+        if resolution is None or self._is_uhd_resolution(resolution):
+            return False
+        audio_languages = self.detect_language_streams(file_path, allow_whisper_fallback=False)[3]
+        # {} sale ante un error de ffprobe o un archivo sin audio: tampoco "cumple"
+        if not audio_languages:
+            return False
+        if not all(str(lang).lower() != "und" for lang in audio_languages.values()):
+            return False
+        # Solo cumple lo que ya produjo el procesador: un .mp4 recién descargado
+        # no tiene la marca y debe procesarse (reglas de audio, compresión).
+        return self._has_processed_marker(file_path)
+
+    def _has_processed_marker(self, file_path: Path) -> bool:
+        """True si el archivo lleva la marca que deja el procesador en sus salidas."""
+        try:
+            result = subprocess.run(
+                ["ffprobe", "-v", "error", "-show_entries", "format_tags=comment",
+                 "-of", "default=nw=1:nk=1", str(file_path)],
+                capture_output=True, text=True, timeout=SHORT_TIMEOUT,
+            )
+        except (subprocess.SubprocessError, OSError):
+            return False
+        return MARCA_PROCESADO in result.stdout
 
     def compress_single_file(self, file_path_str: str) -> Dict:
         """
@@ -2150,6 +2153,22 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
         }
 
         temp_output = None
+        self._original_fp = None
+
+        # Estado por huella: un archivo que ya cumple las reglas se marca done
+        # sin llamar a ffmpeg (idempotencia); si no, pasa a processing.
+        fp = self._fingerprint_for(file_path)
+        try:
+            if self._already_conforms(file_path):
+                if fp:
+                    set_status(fp, "done")
+                self.logger.info(f"{EmojiGenerator.check()} Ya cumple las reglas, se marca completado sin ffmpeg: {file_path.name}")
+                return {**result, "success": True, "skipped": True}
+        except Exception as e:
+            self.logger.warning(f"{EmojiGenerator.warning_msg()} Error verificando si {file_path.name} ya cumple las reglas: {e}")
+        if fp:
+            set_status(fp, "processing")
+            self._original_fp = fp
 
         try:
             # Detecta resolución antes de fijar límites: el contenido 4K/UHD
@@ -2166,16 +2185,15 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
                 self._prepare_compression(file_path, resolution=resolution)
             )
             if not is_prepared:
-                # Si se skippeó, considerarlo exitoso y registrarlo como completado:
-                # si no, se queda en pendientes y se reprocesa en cada ciclo.
+                # Si se omitió (archivo pequeño), queda en skipped: si no, se
+                # queda en pendientes y se reprocesa en cada ciclo.
                 if compression_info.get("skipped", False):
                     result["success"] = True
                     try:
-                        mark_completed(str(file_path))
-                        with open(self.completed_file, "a") as f:
-                            f.write(f"{file_path}\n")
+                        if fp:
+                            set_status(fp, "skipped")
                     except Exception as e:
-                        self.logger.error(f"Error marcando como completado archivo omitido {file_path}: {e}")
+                        self.logger.error(f"Error marcando como omitido {file_path}: {e}")
                 return {**result, **compression_info}
 
             if temp_output is None:
@@ -2193,6 +2211,8 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
                 )
                 if temp_output.exists():
                     temp_output.unlink()
+                if fp:
+                    set_status(fp, "pending")
                 return {**result, "postponed": True}
 
             use_gpu = compression_info["use_gpu"]
@@ -2620,17 +2640,11 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
                 process, file_path, temp_output, new_elapsed_time, False
             )
 
-        # Si después de todos los fallbacks el resultado sigue siendo fallo, registrarlo persistentemente
+        # Si después de todos los fallbacks sigue fallando, se anota en la BD
+        # desde _update_stats_from_result (record_failure).
         if not compression_result.get("success", False):
-            try:
-                failed_files_path = self.failed_file
-                reason = compression_result.get("error", "Fallo en compresión sin mensaje")
-                self._add_to_failed_files(str(file_path), failed_files_path, reason)
-                self.logger.error(
-                    f"Archivo marcado como fallido después de fallback: {file_path.name} | motivo: {reason}"
-                )
-            except Exception as e:
-                self.logger.error(f"Error marcando archivo como fallido: {e}")
+            reason = compression_result.get("error", "Fallo en compresión sin mensaje")
+            self.logger.error(f"Compresión fallida después de fallback: {file_path.name} | motivo: {reason}")
 
         return compression_result
 
@@ -2889,54 +2903,6 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
         }
         self.logger.info(f"Reconstruyendo processed_files desde completados persistidos: {len(self.processed_files)} archivos")
 
-    def _filter_already_processed_files(self, files: List[Path]) -> List[Path]:
-        """Filtra archivos ya procesados exitosamente.
-
-        - Si `reprocess_on_label_change` está habilitado y la etiqueta (sufijo)
-          del archivo actual difiere de la guardada, se volverá a procesar.
-        - Antes de descartar un archivo, si `apply_audio_tagging_on_skip` está
-          activado, se intentará etiquetar pistas de audio sin idioma.
-        """
-        files_before_filter = len(files)
-        remaining = []
-
-        for f in files:
-            key = str(f)
-            skip = False
-
-            if key in self.processed_files and self.processed_files[key]["status"] == "success":
-                # comprobar si debemos volver a procesar por cambio de etiqueta
-                if (
-                    self.config
-                    and self.config.processing.reprocess_on_label_change
-                ):
-                    prev_label = self.processed_files[key].get("label")
-                    if prev_label and f.suffix.lower() != prev_label:
-                        # etiqueta diferente -> no omitir
-                        skip = False
-                    else:
-                        # mismo sufijo, aplicar lógica normal
-                        if f.exists() and f.suffix.lower() == ".mp4":
-                            skip = True
-                else:
-                    if f.exists() and f.suffix.lower() == ".mp4":
-                        skip = True
-
-                # intentar etiquetar audio aunque se vaya a omitir
-                if skip and self.config and self.config.processing.apply_audio_tagging_on_skip:
-                    try:
-                        self._ensure_audio_tags(f)
-                    except Exception as e:
-                        self.logger.error(f"Error etiquetando audio de {f}: {e}")
-
-            if not skip:
-                remaining.append(f)
-
-        files_filtered = files_before_filter - len(remaining)
-        if files_filtered > 0:
-            self.logger.info(f"Archivos ya procesados exitosamente omitidos: {files_filtered}")
-        return remaining
-
     def _process_files_with_executor(
         self, files: List[Path], total_files: int, current_file: int
     ) -> tuple[int, list[str], list[str]]:
@@ -2975,9 +2941,6 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
 
         # Carga estadísticas y archivos procesados de progreso anterior
         current_file = self._load_previous_progress(progress_info)
-
-        # Filtra archivos ya procesados exitosamente
-        files = self._filter_already_processed_files(files)
 
         # Guarda el total de archivos encontrados (escaneados) para cálculos de progreso
         files_pending = len(files)
@@ -3039,7 +3002,8 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
             error_msg = f"Error procesando {file_path}: {str(e)}"
             self.logger.error(error_msg)
             self._record_error(current_errors, file_path.name, error_msg)
-            self.processed_files[str(file_path)] = self._build_failed_entry(str(file_path), str(e))
+            # Un worker muerto (OOM) rompe el pool: es un fallo de recursos.
+            self._record_failure_in_db(file_path, str(e), resource=isinstance(e, BrokenProcessPool))
 
     def _update_size_stats(self, result: dict) -> None:
         """Actualiza estadísticas de tamaño"""
@@ -3052,9 +3016,8 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
     ) -> None:
         """Actualiza estadísticas desde el resultado de procesamiento"""
         # Archivos pospuestos por falta de memoria/disco: no se marcan como
-        # éxito ni como fallo, se dejan intactos (sin tocar processed_files)
-        # para reintentarlos en el siguiente ciclo sin gastar un intento de
-        # la cuarentena de _should_remove_failed_file.
+        # éxito ni como fallo (compress_single_file ya los devolvió a pending)
+        # para reintentarlos en el siguiente ciclo sin gastar un intento.
         if result.get("postponed", False):
             self.stats.files_postponed += 1
             return
@@ -3073,9 +3036,7 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
         # Maneja errores
         if result.get("error"):
             self._record_error(current_errors, file_path.name, result["error"])
-            self.processed_files[str(file_path)] = self._build_failed_entry(str(file_path), result["error"])
-        else:
-            self.processed_files[str(file_path)] = {"status": "success", "timestamp": datetime.now().isoformat()}
+            self._record_failure_in_db(file_path, result["error"])
 
         # Maneja archivos sin español
         if result.get("no_spanish", False):
@@ -3083,6 +3044,22 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
 
         # Actualiza estadísticas de tamaño
         self._update_size_stats(result)
+
+    def _record_failure_in_db(self, file_path: Path, error: str, resource: bool = False) -> None:
+        """Anota el fallo en la BD (cuarentena por huella). Corre en el proceso
+        principal; tras un fallo el original sigue existiendo."""
+        try:
+            rec = get_by_path(file_path)
+            if rec is None:
+                rec, _event = register(file_path, require_settled=False)
+            if rec is None:
+                self.logger.warning(f"{EmojiGenerator.warning_msg()} No se pudo anotar el fallo (archivo no registrado): {file_path}")
+                return
+            status = record_failure(rec.fingerprint, error, resource=resource or self._is_resource_failure(error))
+            if status == "failed":
+                self.logger.warning(f"{EmojiGenerator.warning_msg()} Archivo en cuarentena: {file_path.name}")
+        except Exception as e:
+            self.logger.error(f"Error anotando el fallo de {file_path} en la BD: {e}")
 
     def _update_progress_after_processing(
         self, file_path: Path, processed_count: int, total_files: int, files_in_progress: list
@@ -3127,6 +3104,16 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
         """Ejecuta procesamiento completo"""
         try:
             self.logger.info("=== Iniciando MediaJelly Python ===")
+
+            if migration_pending():
+                self.logger.error(f"{EmojiGenerator.error()} {MIGRATION_PENDING_MESSAGE}")
+                return self.stats
+
+            # Lo que quedó en processing por una caída vuelve a pending
+            try:
+                recover_processing()
+            except Exception as e:
+                self.logger.error(f"Error recuperando archivos en proceso: {e}")
 
             # Al iniciar el procesamiento, marca notified=False en la sección processing (DB)
             try:
@@ -3262,14 +3249,9 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
         """Procesa una línea individual del archivo pending y retorna la acción a tomar"""
         pending_path_obj = Path(file_path)
 
-        # 1. Si ya está completado (procesado exitosamente), remover de pending
-        # Verificar tanto la ruta original como la ruta con extensión .mp4 (por si fue comprimido)
+        # 1. Si ya está completado (procesado exitosamente), remover de pending.
+        # El estado va por huella: no se infiere nada de un .mp4 con el mismo nombre.
         if file_path in completed_files:
-            return "remove"
-
-        # También verificar si existe una versión .mp4 del archivo en completed
-        mp4_version = str(pending_path_obj.with_suffix(".mp4"))
-        if mp4_version in completed_files:
             return "remove"
 
         # 2. Si el archivo original no existe (huérfano), remover
@@ -3277,128 +3259,16 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
             self.logger.warning(f"Archivo huérfano removido de pending (no existe): {pending_path_obj.name}")
             return "orphan"
 
-        # 3. Remover archivos fallidos persistentemente
-        if self._should_remove_failed_file(file_path, pending_path_obj):
-            return "remove"
-
-        # 4. Archivo válido, mantener en pending
+        # 3. Archivo válido (la cuarentena de fallidos vive en la BD), mantener en pending
         return "keep"
 
     @staticmethod
     def _is_resource_failure(error: str) -> bool:
         """True si el error es por falta de recursos (SIGKILL/OOM, timeout)
         en vez de un problema real del archivo (códec corrupto, validación).
-        Estos fallos no deben consumir intentos de la cuarentena: ver
-        _build_failed_entry / _should_remove_failed_file.
+        Estos fallos no consumen intentos de la cuarentena (record_failure).
         """
         return any(marker in error for marker in RESOURCE_FAILURE_MARKERS)
-
-    def _build_failed_entry(self, file_path: str, error: str) -> Dict:
-        """Construye la entrada de processed_files para un archivo que falló.
-
-        IMPORTANTE: preserva `first_failed_timestamp` de intentos anteriores (si existen)
-        y lleva la cuenta de `attempts`. Antes, `timestamp` se sobrescribía en cada intento
-        fallido, lo que reseteaba el reloj de 24h usado por `_should_remove_failed_file` y
-        provocaba que archivos que fallan SIEMPRE (cada corrida de cron) nunca se marcaran
-        como fallidos definitivamente, quedando en un bucle infinito de reintentos.
-
-        Los fallos por falta de recursos (OOM/timeout) NO incrementan `attempts`
-        ni fijan `first_failed_timestamp`: se marcan con `failure_type=resource`
-        para que _should_remove_failed_file los reintente indefinidamente en
-        vez de ponerlos en cuarentena por un problema que era del entorno, no
-        del archivo.
-        """
-        previous = self.processed_files.get(file_path, {})
-        was_failed = previous.get("status") == "failed"
-        first_failed = previous.get("first_failed_timestamp") if was_failed else None
-        attempts = previous.get("attempts", 0) if was_failed else 0
-
-        is_resource_failure = self._is_resource_failure(error)
-        if not is_resource_failure:
-            attempts += 1
-            first_failed = first_failed or datetime.now().isoformat()
-
-        return {
-            "status": "failed",
-            "timestamp": datetime.now().isoformat(),
-            "first_failed_timestamp": first_failed,
-            "attempts": attempts,
-            "error": error,
-            "failure_type": "resource" if is_resource_failure else "content",
-        }
-
-    def _should_remove_failed_file(self, file_path: str, pending_path_obj: Path) -> bool:
-        """Determina si un archivo fallido debe ser removido de pending"""
-        if file_path not in self.processed_files or self.processed_files[file_path].get("status") != "failed":
-            return False
-
-        failed_files_path = self.failed_file
-
-        # Para archivos .ts fallidos, remover inmediatamente
-        if pending_path_obj.suffix.lower() == ".ts":
-            self.logger.warning(f"Removiendo archivo .ts fallido de pendientes: {file_path}")
-            self._add_to_failed_files(file_path, failed_files_path, "Formato .ts incompatible con VAAPI")
-            return True
-
-        # Para otros formatos, verificar si han fallado recientemente
-        failed_info = self.processed_files[file_path]
-
-        # Los fallos por falta de recursos (OOM/timeout) no cuentan para la
-        # cuarentena: se reintentan indefinidamente hasta que haya memoria o
-        # espacio suficiente, en vez de perderse por un problema del entorno.
-        if failed_info.get("failure_type") == "resource":
-            return False
-
-        attempts = failed_info.get("attempts", 1)
-
-        # Quarantine temprana: si ya falló 3 veces seguidas, no tiene sentido seguir
-        # gastando horas de GPU/CPU en él aunque no hayan pasado 24h todavía.
-        if attempts >= 3:
-            self.logger.warning(
-                f"Removiendo archivo fallido de pendientes tras {attempts} intentos consecutivos: {file_path}"
-            )
-            self._add_to_failed_files(file_path, failed_files_path, f"Falló {attempts} veces consecutivas")
-            return True
-
-        # Usar la marca de la PRIMERA falla (no la del último intento) para el chequeo de 24h;
-        # de lo contrario un archivo que falla en cada corrida nunca acumula 24h de antigüedad.
-        timestamp_key = "first_failed_timestamp" if "first_failed_timestamp" in failed_info else "timestamp"
-        if timestamp_key in failed_info:
-            try:
-                failed_time = datetime.fromisoformat(failed_info[timestamp_key])
-                if (datetime.now() - failed_time).total_seconds() > 86400:  # 24 horas
-                    self.logger.warning(f"Removiendo archivo fallido antiguo de pendientes: {file_path}")
-                    self._add_to_failed_files(file_path, failed_files_path, "Falló múltiples veces")
-                    return True
-            except (ValueError, TypeError):
-                self.logger.warning(f"Removiendo archivo fallido con timestamp inválido de pendientes: {file_path}")
-                self._add_to_failed_files(file_path, failed_files_path, "Timestamp inválido")
-                return True
-
-        return False
-
-    def _add_to_failed_files(self, file_path: str, failed_files_path: Path, reason: str) -> None:
-        """Agrega un archivo a la lista de archivos fallidos con su razón"""
-        try:
-            # Leer archivos fallidos existentes para evitar duplicados
-            existing_failed = set()
-            if failed_files_path.exists():
-                with open(failed_files_path, "r") as f:
-                    for line in f:
-                        if line.strip():
-                            # Extraer solo la ruta del archivo (sin timestamp ni razón)
-                            parts = line.strip().split(" | ")
-                            if parts:
-                                existing_failed.add(parts[0])
-
-            # Agregar solo si no existe
-            if file_path not in existing_failed:
-                with open(failed_files_path, "a") as f:
-                    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    f.write(f"{file_path} | {timestamp} | {reason}\n")
-                self.logger.info(f"Archivo agregado a failed-compression.txt: {Path(file_path).name}")
-        except Exception as e:
-            self.logger.error(f"Error agregando archivo a failed-compression.txt: {e}")
 
     def _rewrite_pending_file(self, remaining_pending: List[str]) -> None:
         """Actualiza la tabla pending_files en la DB con la lista de remaining_pending."""
