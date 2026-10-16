@@ -47,10 +47,10 @@ import logging
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 from mediajelly_utils import MediaJellyPaths, create_compressed_rotating_file_handler
-from mediajelly_db import add_pending, get_pending_files, get_all_completed_files
+from mediajelly_db import register, mark_missing_except, purge_missing, replace_subtitle_queue
 
 # Comprobaciones simultáneas de subtítulos (un ffprobe por video)
 SUBTITLE_CHECK_WORKERS = 4
@@ -72,9 +72,6 @@ class MediaScanner:
         scripts_dir (Path): Directorio de scripts
         tmp_dir (Path): Directorio temporal para archivos de estado
         logs_dir (Path): Directorio de logs
-        pending_file (Path): Archivo con lista de archivos pendientes de comprimir
-        pending_subtitles_file (Path): Archivo con archivos que necesitan subtítulos
-        completed_file (Path): Archivo con lista de archivos completados
         log_file (Path): Archivo de log del scanner
         logger (logging.Logger): Logger configurado
         start_time (float): Timestamp de inicio del escaneo
@@ -98,9 +95,6 @@ class MediaScanner:
         self.logs_dir = self.scripts_dir / "tmp" / "logs"
 
         # Archivos
-        self.pending_file = self.tmp_dir / "pending-compression.txt"
-        self.pending_subtitles_file = self.tmp_dir / "pending_subtitles.txt"
-        self.completed_file = self.tmp_dir / "completed.txt"
         self.log_file = self.logs_dir / "scan.log"
 
         # Configura logging
@@ -108,8 +102,6 @@ class MediaScanner:
 
         # Crea directorios
         self.logs_dir.mkdir(parents=True, exist_ok=True)
-        self.completed_file.touch()
-        self.pending_subtitles_file.touch()
 
         self.start_time = time.time()
 
@@ -167,122 +159,77 @@ class MediaScanner:
 
         return found_files
 
-    def _load_completed_files(self) -> set:
-        """Carga archivos completados desde la DB (compatibilidad con completed.txt)."""
-        try:
-            files = get_all_completed_files()
-            return {str(p) for p in files}
-        except Exception:
-            return set()
-
-    def _load_existing_pending(self) -> tuple[List[str], set]:
-        """Carga archivos pendientes existentes"""
-        existing_pending_paths = []
-        existing_pending_normalized = set()
-        try:
-            db_pending = get_pending_files()
-            for p in db_pending:
-                s = str(p)
-                existing_pending_paths.append(s)
-                existing_pending_normalized.add(s)
-        except Exception:
-            pass
-        return existing_pending_paths, existing_pending_normalized
-
     def scan_media_directories(self, media_dirs: List[Path]) -> tuple[int, int]:
-        """Escanea los directorios de medios y actualiza archivo de pendientes"""
+        """Escanea los directorios de medios y registra los archivos por huella"""
         # Validar directorios
         valid_dirs = [d for d in media_dirs if d.exists()]
         if not valid_dirs:
             self.logger.warning("No hay directorios válidos para escanear")
             return 0, 0
 
-        # Cargar datos existentes
-        completed_files = self._load_completed_files()
-        _, existing_pending_normalized = self._load_existing_pending()
-
         # Escanear todos los directorios
-        all_found_files = self._scan_all_directories(valid_dirs, existing_pending_normalized, completed_files)
+        all_found_files = self._scan_all_directories(valid_dirs)
 
-        # Procesar archivos nuevos
-        return self._process_new_files(all_found_files, existing_pending_normalized, completed_files)
+        # Registrar por huella (nuevos, renombrados, etc.)
+        return self._process_new_files(all_found_files, valid_dirs)
 
-    def _scan_all_directories(
-        self, media_dirs: List[Path], existing_pending_normalized: set, completed_files: set
-    ) -> List[Path]:
+    def _scan_all_directories(self, media_dirs: List[Path]) -> List[Path]:
         """Escanea todos los directorios y retorna archivos encontrados"""
         all_found_files = []
         for media_dir in media_dirs:
             found_files = self.scan_folder_optimized(media_dir)
             all_found_files.extend(found_files)
-
-            # Contar archivos nuevos
-            new_count = len(
-                [
-                    f
-                    for f in found_files
-                    if str(f.resolve()) not in existing_pending_normalized and str(f.resolve()) not in completed_files
-                ]
-            )
-            self.logger.info(f"Directorio {media_dir.name}: {len(found_files)} encontrados, {new_count} nuevos")
+            self.logger.info(f"Directorio {media_dir.name}: {len(found_files)} encontrados")
 
         return all_found_files
 
-    def _process_new_files(
-        self, all_found_files: List[Path], existing_pending_normalized: set, completed_files: set
-    ) -> tuple[int, int]:
-        """Procesa archivos nuevos y los agrega a pendientes"""
-        # Filtrar archivos nuevos
-        new_files_candidates = []
-        for file_path in all_found_files:
-            path_str = str(file_path)
-            if path_str in existing_pending_normalized:
-                self.logger.debug(f"Archivo ya en pendientes: {file_path.name}")
-                continue
-            elif path_str in completed_files:
-                # Si es MKV y no hay MP4 correspondiente, reprocesar
-                if file_path.suffix.lower() == '.mkv':
-                    mp4_path = file_path.with_suffix('.mp4')
-                    if not mp4_path.exists():
-                        self.logger.info(f"MKV completado sin MP4 correspondiente, reprocesando: {file_path.name}")
-                        new_files_candidates.append(file_path)
-                    else:
-                        self.logger.debug(f"Archivo ya completado con MP4: {file_path.name}")
-                else:
-                    self.logger.debug(f"Archivo ya completado: {file_path.name}")
-            else:
-                self.logger.debug(f"Archivo candidato nuevo: {file_path.name}")
-                new_files_candidates.append(file_path)
+    def _process_new_files(self, all_found_files: List[Path], roots: Optional[List[Path]] = None) -> tuple[int, int]:
+        """Registra cada archivo por huella y devuelve (encontrados, nuevos)"""
+        counts = {"new": 0, "renamed": 0, "unchanged": 0, "unsettled": 0, "duplicate": 0}
+        new_files: List[str] = []
 
-        if not new_files_candidates:
+        for file_path in all_found_files:
+            try:
+                record, event = register(file_path)
+            except Exception as e:
+                self.logger.error(f"Error registrando {file_path.name}: {e}")
+                continue
+
+            if event in ("new", "replaced"):
+                counts["new"] += 1
+                new_files.append(str(file_path))
+            elif event == "renamed":
+                counts["renamed"] += 1
+            elif event in counts:
+                counts[event] += 1
+            else:
+                self.logger.info(f"Archivo {event}: {file_path.name}")
+
+        self.logger.info(
+            f"Nuevos: {counts['new']}, renombrados: {counts['renamed']}, sin cambios: {counts['unchanged']}, "
+            f"en copia: {counts['unsettled']}, duplicados: {counts['duplicate']}"
+        )
+
+        # Marcar ausentes (todas las rutas de todos los directorios) y purgar los antiguos
+        try:
+            mark_missing_except({str(p) for p in all_found_files}, roots=self._roots_with_files(all_found_files, roots))
+            purge_missing()
+        except Exception as e:
+            self.logger.error(f"Error actualizando archivos ausentes: {e}")
+
+        if not new_files:
             self.logger.info("No hay archivos nuevos para agregar a pendientes")
             return len(all_found_files), 0
 
-        # No validar integridad aquí, dejarlo al processor
-        new_files_to_add = [str(file_path) for file_path in new_files_candidates]
+        self._log_new_files_added(new_files)
+        return len(all_found_files), len(new_files)
 
-        if not new_files_to_add:
-            self.logger.info("No hay archivos válidos para agregar a pendientes")
-            return len(all_found_files), 0
-
-        # Ordenar por tamaño (más grandes primero)
-        new_files_to_add.sort(key=lambda f: Path(f).stat().st_size, reverse=True)
-
-        # Agregar al archivo de pendientes
-        self._append_to_pending_file(new_files_to_add)
-
-        # Log de archivos agregados
-        self._log_new_files_added(new_files_to_add)
-
-        return len(all_found_files), len(new_files_to_add)
-
-    def _append_to_pending_file(self, new_files: List[str]):
-        """Agrega archivos nuevos al archivo de pendientes"""
-        for fp in new_files:
-            try:
-                add_pending(fp)
-            except Exception as e:
-                self.logger.error(f"Error agregando archivo a pendientes (DB): {e}")
+    @staticmethod
+    def _roots_with_files(all_found_files: List[Path], roots: Optional[List[Path]]) -> List[str]:
+        """Raíces que existen y produjeron al menos un archivo (protege montajes caídos o vacíos)"""
+        if roots is None:
+            return []
+        return [str(r) for r in roots if any(r in f.parents for f in all_found_files)]
 
     def _log_new_files_added(self, new_files: List[str]):
         """Registra archivos nuevos agregados"""
@@ -302,7 +249,7 @@ class MediaScanner:
         # Determinar archivos que necesitan subtítulos (sin cargar existentes)
         files_needing_subtitles = self._find_files_needing_subtitles_fresh(all_video_files)
 
-        # REESCRIBIR el archivo completo con la lista actualizada
+        # Reemplazar la cola completa con la lista actualizada
         self._write_subtitle_files(files_needing_subtitles)
 
         if not files_needing_subtitles:
@@ -313,17 +260,6 @@ class MediaScanner:
 
         self.logger.info("=== Escaneo de subtítulos completado ===")
         return len(files_needing_subtitles)
-
-    def _load_existing_pending_subtitles(self) -> set:
-        """Carga archivos pendientes de subtítulos existentes"""
-        existing_pending_subtitles = set()
-        if self.pending_subtitles_file.exists():
-            try:
-                with open(self.pending_subtitles_file, "r") as f:
-                    existing_pending_subtitles = {line.strip() for line in f if line.strip()}
-            except Exception as e:
-                self.logger.error(f"Error cargando archivos pendientes de subtítulos: {e}")
-        return existing_pending_subtitles
 
     def _find_all_video_files(self, media_dirs: List[Path]) -> List[Path]:
         """Encuentra todos los archivos de video en los directorios"""
@@ -458,36 +394,12 @@ class MediaScanner:
 
         return False
 
-    def _clean_compressed_files_from_pending(self):
-        """Limpia archivos comprimidos del archivo pending_subtitles.txt"""
-        if not self.pending_subtitles_file.exists():
-            return
-
-        try:
-            with open(self.pending_subtitles_file, "r") as f:
-                lines = f.readlines()
-
-            # Filtrar líneas que no contengan ".compressed"
-            cleaned_lines = [line for line in lines if ".compressed" not in line]
-
-            # Si se removieron líneas, reescribir el archivo
-            if len(cleaned_lines) != len(lines):
-                removed_count = len(lines) - len(cleaned_lines)
-                with open(self.pending_subtitles_file, "w") as f:
-                    f.writelines(cleaned_lines)
-                self.logger.info(f"Limpiados {removed_count} archivos comprimidos de pending_subtitles.txt")
-
-        except Exception as e:
-            self.logger.error(f"Error limpiando archivos comprimidos de pending_subtitles.txt: {e}")
-
     def _write_subtitle_files(self, files_needing_subtitles: List[str]):
-        """Reescribe el archivo pending_subtitles.txt con la lista actual"""
+        """Reemplaza la cola de subtítulos en la base de datos"""
         try:
-            with open(self.pending_subtitles_file, "w") as f:
-                for file_path in files_needing_subtitles:
-                    f.write(f"{file_path}\n")
+            replace_subtitle_queue(files_needing_subtitles)
         except Exception as e:
-            self.logger.error(f"Error escribiendo pending_subtitles.txt: {e}")
+            self.logger.error(f"Error escribiendo la cola de subtítulos (DB): {e}")
 
     def _log_subtitle_files_added(self, files_needing_subtitles: List[str]):
         """Registra archivos de subtítulos encontrados"""
