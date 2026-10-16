@@ -25,7 +25,13 @@ import tempfile
 from mediajelly_emoji import EmojiGenerator
 from mediajelly_utils import MediaJellyPaths, create_compressed_rotating_file_handler
 from mediajelly_whisper_extractor import WhisperAudioExtractorMixin, WHISPER_AVAILABLE
-from mediajelly_db import get_pending_files, load_progress, save_progress
+from mediajelly_db import (
+    get_pending_files,
+    get_subtitle_queue,
+    load_progress,
+    remove_from_subtitle_queue,
+    save_progress,
+)
 
 # Importar configuración centralizada
 try:
@@ -1766,13 +1772,13 @@ class SubtitleTranslator(WhisperAudioExtractorMixin):
 
     def _cleanup_missing_files(self, missing_files: List[str]):
         """
-        Limpia archivos no encontrados de pending_subtitles.txt y last_input_args.
+        Limpia archivos no encontrados de la cola de subtítulos y last_input_args.
 
         Args:
             missing_files: Lista de rutas de archivos faltantes.
         """
         try:
-            # Limpiar de pending_subtitles.txt
+            # Limpiar de la cola de subtítulos (BD)
             self._remove_from_pending_subtitles(missing_files)
 
             # Limpiar de last_input_args en el archivo de progreso
@@ -1785,35 +1791,16 @@ class SubtitleTranslator(WhisperAudioExtractorMixin):
 
     def _remove_from_pending_subtitles(self, file_paths: List[str]):
         """
-        Remueve archivos específicos de pending_subtitles.txt.
+        Remueve archivos específicos de la cola de subtítulos en la BD.
 
         Args:
             file_paths: Lista de rutas de archivos a remover.
         """
-        pending_file = self.scripts_dir / "pending_subtitles.txt"
-
-        if not pending_file.exists():
-            return
-
         try:
-            with open(pending_file, "r") as f:
-                pending_lines = [line.strip() for line in f if line.strip()]
-
-            # Remover los archivos no encontrados
-            original_count = len(pending_lines)
-            pending_lines = [line for line in pending_lines if line not in file_paths]
-
-            # Reescribir solo si cambió algo
-            if len(pending_lines) != original_count:
-                with open(pending_file, "w") as f:
-                    for line in pending_lines:
-                        f.write(f"{line}\n")
-
-                removed_count = original_count - len(pending_lines)
-                self.logger.debug(f"Removidos {removed_count} archivos de pending_subtitles.txt")
-
+            remove_from_subtitle_queue([str(p) for p in file_paths])
+            self.logger.debug(f"Removidos {len(file_paths)} archivos de la cola de subtítulos")
         except Exception as e:
-            self.logger.error(f"Error removiendo archivos de pending_subtitles.txt: {e}")
+            self.logger.error(f"Error removiendo archivos de la cola de subtítulos: {e}")
 
     def _remove_from_last_input_args(self, file_paths: List[str]):
         """
@@ -3590,26 +3577,23 @@ def _execute_processing(args, translator) -> dict:
 def _handle_resume_logic(args, translator) -> dict | None:
     """Maneja la lógica de reanudación de procesos incompletos"""
     if not args.paths:
-        # Primero intentar leer archivos pendientes de subtítulos para ejecución automática
-        pending_file = Path(CONTAINER_PATH) / "scripts" / "tmp" / "pending_subtitles.txt"
-        if pending_file.exists():
-            try:
-                with open(pending_file, "r", encoding="utf-8") as f:
-                    pending_paths = [line.strip() for line in f if line.strip()]
+        # Primero intentar leer la cola de subtítulos de la BD para ejecución automática
+        try:
+            pending_paths = [str(p) for p in get_subtitle_queue()]
 
-                if pending_paths:
-                    translator.logger.info(f"Encontrados {len(pending_paths)} archivos pendientes de subtítulos")
-                    translator.logger.info(f"Primeros 3 paths: {pending_paths[:3]}")
-                    translator.logger.info("Procesando archivos pendientes automáticamente...")
+            if pending_paths:
+                translator.logger.info(f"Encontrados {len(pending_paths)} archivos pendientes de subtítulos")
+                translator.logger.info(f"Primeros 3 paths: {pending_paths[:3]}")
+                translator.logger.info("Procesando archivos pendientes automáticamente...")
 
-                    # Simular que se pasaron estos paths como argumentos
-                    args.paths = pending_paths
-                    translator.logger.info(f"args.paths establecido con {len(args.paths)} elementos")
-                    return None
-                else:
-                    translator.logger.info("Archivo pending_subtitles.txt existe pero está vacío")
-            except Exception as e:
-                translator.logger.error(f"Error leyendo archivo de subtítulos pendientes: {e}")
+                # Simular que se pasaron estos paths como argumentos
+                args.paths = pending_paths
+                translator.logger.info(f"args.paths establecido con {len(args.paths)} elementos")
+                return None
+            else:
+                translator.logger.info("La cola de subtítulos está vacía")
+        except Exception as e:
+            translator.logger.error(f"Error leyendo la cola de subtítulos: {e}")
 
         # Si no hay archivos pendientes, intentar reanudar proceso incompleto
         if _should_resume_incomplete_process(translator):

@@ -22,6 +22,8 @@ from mediajelly_utils import MediaJellyPaths, archive_legacy_log_file, create_co
 # Agregar scripts al path para imports
 sys.path.insert(0, str(Path(__file__).parent))
 
+from mediajelly_db import MIGRATION_PENDING_MESSAGE, migration_pending
+
 # Importar módulos directamente para evitar subprocess overhead
 try:
     from mediajelly_scanner import MediaScanner
@@ -522,6 +524,12 @@ class MediaJellyCron:
         subtitle_job: Optional[BackgroundJob] = None
         try:
             self.logger.info("Iniciando ciclo de procesamiento")
+
+            # Con historial anterior sin migrar, todo se registraría como pending y se
+            # recomprimiría la biblioteca: no se procesa nada hasta migrar
+            if migration_pending():
+                self.logger.error(f"{EmojiGenerator.error()} {MIGRATION_PENDING_MESSAGE}")
+                return False
 
             # Paso 1: Ejecutar scanner siempre
             if not self.run_scanner():
