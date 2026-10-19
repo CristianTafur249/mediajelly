@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+{% block contenido %}
+<div class="tarjeta mas">
+  <a href="#" class="externo" data-puerto="8096" target="_blank" rel="noopener">Jellyfin</a>
+  <a href="#" class="externo" data-puerto="8989" target="_blank" rel="noopener">Sonarr</a>
+  <a href="#" class="externo" data-puerto="7878" target="_blank" rel="noopener">Radarr</a>
+  <a href="#" class="externo" data-puerto="5055" target="_blank" rel="noopener">Seerr</a>
+  <form method="post" action="/salir"><button type="submit" class="enlace">Salir</button></form>
+</div>
+{% endblock %}

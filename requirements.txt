@@ -22,3 +22,13 @@ telethon>=1.34.0
 
 # Redis (caché)
 redis>=5.0.0
+
+# Panel web (instalado en su propia capa del Dockerfile con estas mismas versiones;
+# fijas para el Python 3.10 de la imagen: starlette 1.8+ y websockets 17+ exigen 3.11)
+fastapi==0.146.0
+starlette==1.7.0
+uvicorn[standard]==0.54.0
+websockets==16.1.1
+itsdangerous==2.2.0
+python-multipart==0.0.32
+jinja2==3.1.6

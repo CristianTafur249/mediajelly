@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ titulo }} · MediaJelly</title>
+  <link rel="stylesheet" href="/estaticos/panel.css">
+  <script src="/estaticos/htmx.min.js" defer></script>
+  <script src="/estaticos/sse.js" defer></script>
+</head>
+<body>
+  <nav class="lateral">
+    <div class="marca">MediaJelly</div>
+    <a href="/" {% if activo == 'inicio' %}class="activo"{% endif %}>Inicio</a>
+    <a href="/cola" {% if activo == 'cola' %}class="activo"{% endif %}>Cola</a>
+    <a href="/registros" {% if activo == 'registros' %}class="activo"{% endif %}>Registros</a>
+    <hr>
+    <a href="#" class="externo" data-puerto="8096" target="_blank" rel="noopener">Jellyfin</a>
+    <a href="#" class="externo" data-puerto="8989" target="_blank" rel="noopener">Sonarr</a>
+    <a href="#" class="externo" data-puerto="7878" target="_blank" rel="noopener">Radarr</a>
+    <a href="#" class="externo" data-puerto="5055" target="_blank" rel="noopener">Seerr</a>
+    <form method="post" action="/salir"><button type="submit" class="enlace">Salir</button></form>
+  </nav>
+
+  <main>
+    <h1>{{ titulo }}</h1>
+    {% block contenido %}{% endblock %}
+  </main>
+
+  <nav class="inferior">
+    <a href="/" {% if activo == 'inicio' %}class="activo"{% endif %}>Inicio</a>
+    <a href="/cola" {% if activo == 'cola' %}class="activo"{% endif %}>Cola</a>
+    <a href="/registros" {% if activo == 'registros' %}class="activo"{% endif %}>Registros</a>
+    <a href="/mas" {% if activo == 'mas' %}class="activo"{% endif %}>Más</a>
+  </nav>
+
+  <script>
+    // htmx no cambia el contenido con un 4xx; con 400 (lote vacío) y 409 (el archivo
+    // cambió) sí, para mostrar el aviso. 404 y 500 no se muestran.
+    document.body.addEventListener("htmx:beforeSwap", function (e) {
+      if (e.detail.xhr.status === 409 || e.detail.xhr.status === 400) { e.detail.shouldSwap = true; e.detail.isError = false; }
+    });
+    // Los enlaces externos apuntan al mismo equipo que sirve el panel.
+    document.querySelectorAll("a.externo").forEach(function (a) {
+      a.href = location.protocol + "//" + location.hostname + ":" + a.dataset.puerto + "/";
+    });
+  </script>
+</body>
+</html>
