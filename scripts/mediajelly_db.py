@@ -34,7 +34,7 @@ except ImportError:  # importado como paquete (scripts.mediajelly_db)
 
 DB_LOCK = threading.Lock()
 MIGRATION_PENDING_MESSAGE = "Migración pendiente: ejecute mediajelly_migrate.py --apply"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 MAX_ATTEMPTS = 3
 FAILURE_WINDOW_HOURS = 24
 # Días de espera antes de volver a pasar por Whisper un archivo terminado
@@ -157,10 +157,19 @@ def _create_media_state_schema(conn: sqlite3.Connection) -> None:
             missing_since TEXT,
             status_before_missing TEXT,
             created_at TEXT,
-            updated_at TEXT
+            updated_at TEXT,
+            prioridad INTEGER NOT NULL DEFAULT 0
         )
         """
     )
+    # Bases creadas antes de la v3 no tienen la columna: se agrega sin perder filas
+    columnas = {r[1] for r in conn.execute("PRAGMA table_info(media_files)")}
+    if "prioridad" not in columnas:
+        try:
+            conn.execute("ALTER TABLE media_files ADD COLUMN prioridad INTEGER NOT NULL DEFAULT 0")
+        except sqlite3.OperationalError as exc:
+            if "duplicate column" not in str(exc).lower():  # otro proceso ya la agregó
+                raise
     conn.execute("CREATE INDEX IF NOT EXISTS idx_media_files_status ON media_files(status)")
     conn.execute(
         """
@@ -205,6 +214,20 @@ def _create_media_state_schema(conn: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS language_attempts (
             fingerprint TEXT PRIMARY KEY,
             attempted_at TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS panel_tareas (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tipo TEXT NOT NULL,
+            argumentos TEXT NOT NULL,
+            estado TEXT NOT NULL,
+            salida TEXT,
+            creada TEXT,
+            iniciada TEXT,
+            terminada TEXT
         )
         """
     )
@@ -466,7 +489,7 @@ def remove_pending(path) -> None:
 
 
 def get_pending_files() -> List[Path]:
-    """Devuelve las rutas pendientes (ordenadas por created_at) como objetos Path."""
+    """Devuelve las rutas pendientes (por prioridad y luego created_at) como objetos Path."""
     return [Path(r.path) for r in list_by_status("pending")]
 
 
@@ -717,6 +740,17 @@ def get_by_path(path) -> Optional[MediaRecord]:
 
 
 @retry_on_locked()
+def get_by_fingerprint(fp: str) -> Optional[MediaRecord]:
+    """Devuelve el registro de una huella, o None si no existe."""
+    init_db()
+    with DB_LOCK:
+        conn = _get_conn()
+        record = _fetch_record(conn, fp)
+        conn.close()
+    return record
+
+
+@retry_on_locked()
 def list_by_status(*statuses: str) -> List[MediaRecord]:
     """Devuelve los registros con alguno de los estados indicados (al menos uno)."""
     if not statuses:
@@ -726,7 +760,7 @@ def list_by_status(*statuses: str) -> List[MediaRecord]:
     with DB_LOCK:
         conn = _get_conn()
         rows = conn.execute(
-            f"SELECT {_MEDIA_COLUMNS} FROM media_files WHERE status IN ({marks}) ORDER BY created_at ASC, path ASC",
+            f"SELECT {_MEDIA_COLUMNS} FROM media_files WHERE status IN ({marks}) ORDER BY prioridad DESC, created_at ASC, path ASC",
             statuses,
         ).fetchall()
         conn.close()
@@ -755,6 +789,39 @@ def set_status(fp: str, status: str) -> None:
                     "UPDATE media_files SET status = ?, updated_at = datetime('now') WHERE fingerprint = ?",
                     (status, fp),
                 )
+        conn.close()
+
+
+@retry_on_locked()
+def reiniciar_fallos(fp: str) -> None:
+    """Borra el conteo de fallos de una huella sin cambiar su estado (reproceso a mano)."""
+    init_db()
+    with DB_LOCK:
+        conn = _get_conn()
+        with conn:
+            conn.execute(
+                """
+                UPDATE media_files
+                SET attempts = 0, first_failed_at = NULL, failure_type = NULL,
+                    updated_at = datetime('now')
+                WHERE fingerprint = ?
+                """,
+                (fp,),
+            )
+        conn.close()
+
+
+@retry_on_locked()
+def set_prioridad(fp: str, prioridad: int) -> None:
+    """Fija la prioridad de una huella en la cola (mayor valor se procesa antes)."""
+    init_db()
+    with DB_LOCK:
+        conn = _get_conn()
+        with conn:
+            conn.execute(
+                "UPDATE media_files SET prioridad = ?, updated_at = datetime('now') WHERE fingerprint = ?",
+                (int(prioridad), fp),
+            )
         conn.close()
 
 
@@ -991,6 +1058,23 @@ def get_stream_languages(fp: str) -> Dict[int, str]:
 
 
 @retry_on_locked()
+def borrar_idiomas_detectados(fp: str) -> int:
+    """Borra los idiomas que Whisper detectó para una huella (fuente "whisper").
+
+    Conserva los corregidos a mano y los de otras fuentes. Devuelve cuántos borró.
+    """
+    init_db()
+    with DB_LOCK:
+        conn = _get_conn()
+        with conn:
+            n = conn.execute(
+                "DELETE FROM stream_languages WHERE fingerprint = ? AND source = 'whisper'", (fp,)
+            ).rowcount
+        conn.close()
+    return n
+
+
+@retry_on_locked()
 def record_retag_failure(fp: str, error: str) -> None:
     """Anota que el re-etiquetado de esta huella falló, para no repetir el remux."""
     init_db()
@@ -1162,3 +1246,158 @@ def remove_from_subtitle_queue(paths: List[str]) -> None:
                 [(str(p),) for p in paths],
             )
         conn.close()
+
+
+# --- Tareas del panel --------------------------------------------------------
+# El panel encola acciones pesadas; mediajelly_tareas.py (contenedor del cron)
+# las ejecuta. Estados: pendiente, corriendo, ok, error.
+
+TIPOS_TAREA = {"ciclo", "retag", "detectar"}
+_TAREA_COLUMNAS = "id, tipo, argumentos, estado, salida, creada, iniciada, terminada"
+
+
+def _tarea_a_dict(row: sqlite3.Row) -> dict:
+    d = dict(row)
+    d["argumentos"] = json.loads(d["argumentos"])
+    return d
+
+
+@retry_on_locked()
+def crear_tarea(tipo: str, argumentos: dict) -> Tuple[int, bool]:
+    """Encola una tarea. Devuelve (id, creada); si ya hay una pendiente o corriendo
+    igual (mismo tipo y argumentos), devuelve la existente con creada=False."""
+    if tipo not in TIPOS_TAREA:
+        raise ValueError(f"Tipo de tarea desconocido: {tipo!r}")
+    args_json = json.dumps(argumentos, sort_keys=True, ensure_ascii=False)
+    init_db()
+    with DB_LOCK:
+        conn = _get_conn()
+        try:
+            conn.isolation_level = None
+            with _immediate(conn):
+                row = conn.execute(
+                    "SELECT id FROM panel_tareas WHERE tipo = ? AND argumentos = ? "
+                    "AND estado IN ('pendiente', 'corriendo') ORDER BY id LIMIT 1",
+                    (tipo, args_json),
+                ).fetchone()
+                if row:
+                    return int(row["id"]), False
+                cur = conn.execute(
+                    "INSERT INTO panel_tareas(tipo, argumentos, estado, creada) "
+                    "VALUES (?, ?, 'pendiente', datetime('now'))",
+                    (tipo, args_json),
+                )
+                return int(cur.lastrowid), True
+        finally:
+            conn.close()
+
+
+@retry_on_locked()
+def hay_tareas_pendientes() -> bool:
+    """Consulta barata: ¿queda alguna tarea pendiente? (el ejecutor la usa cada minuto)."""
+    init_db()
+    with DB_LOCK:
+        conn = _get_conn()
+        row = conn.execute("SELECT 1 FROM panel_tareas WHERE estado = 'pendiente' LIMIT 1").fetchone()
+        conn.close()
+    return row is not None
+
+
+@retry_on_locked()
+def tomar_siguiente_tarea() -> Optional[dict]:
+    """Pasa de forma atómica la tarea pendiente más antigua a corriendo y la devuelve."""
+    init_db()
+    with DB_LOCK:
+        conn = _get_conn()
+        try:
+            conn.isolation_level = None
+            with _immediate(conn):
+                row = conn.execute(
+                    f"SELECT {_TAREA_COLUMNAS} FROM panel_tareas WHERE estado = 'pendiente' "
+                    "ORDER BY id ASC LIMIT 1"
+                ).fetchone()
+                if row is None:
+                    return None
+                conn.execute(
+                    "UPDATE panel_tareas SET estado = 'corriendo', iniciada = datetime('now') WHERE id = ?",
+                    (row["id"],),
+                )
+                row = conn.execute(
+                    f"SELECT {_TAREA_COLUMNAS} FROM panel_tareas WHERE id = ?", (row["id"],)
+                ).fetchone()
+                return _tarea_a_dict(row)
+        finally:
+            conn.close()
+
+
+@retry_on_locked()
+def terminar_tarea(id: int, ok: bool, salida: str) -> None:
+    """Cierra una tarea como ok o error con su salida."""
+    init_db()
+    with DB_LOCK:
+        conn = _get_conn()
+        with conn:
+            conn.execute(
+                "UPDATE panel_tareas SET estado = ?, salida = ?, terminada = datetime('now') WHERE id = ?",
+                ("ok" if ok else "error", salida, id),
+            )
+        conn.close()
+
+
+@retry_on_locked()
+def liberar_tareas_colgadas(minutos: int = 120) -> int:
+    """Marca como error las tareas corriendo desde hace más de `minutos`. Devuelve cuántas."""
+    init_db()
+    with DB_LOCK:
+        conn = _get_conn()
+        with conn:
+            cur = conn.execute(
+                "UPDATE panel_tareas SET estado = 'error', salida = ?, terminada = datetime('now') "
+                "WHERE estado = 'corriendo' AND iniciada < datetime('now', ?)",
+                ("Interrumpida (proceso detenido)", f"-{int(minutos)} minutes"),
+            )
+            n = cur.rowcount
+        conn.close()
+    return n
+
+
+@retry_on_locked()
+def reasignar_tareas(fp_viejo: str, fp_nuevo: str) -> int:
+    """Pasa a fp_nuevo las tareas pendientes que apuntan a fp_viejo (tras reescribir
+    el archivo, p. ej. un retag). Devuelve cuántas cambió."""
+    init_db()
+    with DB_LOCK:
+        conn = _get_conn()
+        try:
+            conn.isolation_level = None
+            with _immediate(conn):
+                cambiadas = 0
+                for row in conn.execute(
+                    "SELECT id, argumentos FROM panel_tareas WHERE estado = 'pendiente'"
+                ).fetchall():
+                    argumentos = json.loads(row["argumentos"])
+                    if not isinstance(argumentos, dict) or argumentos.get("fp") != fp_viejo:
+                        continue
+                    argumentos["fp"] = fp_nuevo
+                    # mismo formato que crear_tarea, para que la deduplicación siga valiendo
+                    conn.execute(
+                        "UPDATE panel_tareas SET argumentos = ? WHERE id = ?",
+                        (json.dumps(argumentos, sort_keys=True, ensure_ascii=False), row["id"]),
+                    )
+                    cambiadas += 1
+                return cambiadas
+        finally:
+            conn.close()
+
+
+@retry_on_locked()
+def listar_tareas(limite: int = 20) -> List[dict]:
+    """Devuelve las tareas más recientes primero."""
+    init_db()
+    with DB_LOCK:
+        conn = _get_conn()
+        rows = conn.execute(
+            f"SELECT {_TAREA_COLUMNAS} FROM panel_tareas ORDER BY id DESC LIMIT ?", (int(limite),)
+        ).fetchall()
+        conn.close()
+    return [_tarea_a_dict(r) for r in rows]
