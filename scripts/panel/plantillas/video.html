@@ -1,0 +1,90 @@
+{% extends "base.html" %}
+{% block contenido %}
+<div class="video">
+  <p><a href="/cola">← Volver a la cola</a></p>
+  {% if error_bd %}
+  <p class="aviso">{{ error_bd }}</p>
+  {% elif not detalle %}
+  <p>No se encontró ese video. Puede que lo hayan renombrado, recomprimido o borrado; vuelve a la cola y recarga.</p>
+  {% else %}
+  {% set a = detalle.archivo %}
+  {% set v = detalle.video %}
+  <section class="tarjeta">
+    <div class="archivo-cabecera">
+      <span class="video-ruta" title="{{ a.ruta }}">{{ a.ruta }}</span>
+      {% set nombres_estado = {"pending": "Pendiente", "processing": "En proceso", "done": "Terminado", "skipped": "Omitido", "failed": "Cuarentena", "missing": "No está en disco"} %}<span class="insignia">{{ nombres_estado.get(a.estado, a.estado) }}</span>
+    </div>
+    <dl class="datos-video">
+      {% if v.codec %}<div><dt>Video</dt><dd>{{ v.codec }}{% if v.ancho %} · {{ v.ancho }}×{{ v.alto }}{% endif %}</dd></div>{% endif %}
+      {% if v.bitrate_kbps %}<div><dt>Bitrate</dt><dd>{{ v.bitrate_kbps }} kbps</dd></div>{% endif %}
+      {% if v.get('duracion') is not none %}<div><dt>Duración</dt><dd>{{ v.duracion|tiempo }}</dd></div>{% endif %}
+      {% if v.tamano %}<div><dt>Tamaño</dt><dd>{{ v.tamano|tamano }}</dd></div>{% endif %}
+      <div><dt>Intentos</dt><dd>{{ a.intentos }}</dd></div>
+      {% if a.prioridad %}<div><dt>Prioridad</dt><dd>{{ a.prioridad }}</dd></div>{% endif %}
+      {% if a.creado %}<div><dt>Registrado</dt><dd>{{ a.creado }}</dd></div>{% endif %}
+      {% if a.actualizado %}<div><dt>Actualizado</dt><dd>{{ a.actualizado }}</dd></div>{% endif %}
+    </dl>
+    {% if a.derived_from %}<p class="suave">Viene de la huella {{ a.derived_from }}</p>{% endif %}
+    {% if a.error %}
+    <details class="archivo-error">
+      <summary>{{ a.error.splitlines()[0] if a.error.splitlines() else a.error }}</summary>
+      <pre>{{ a.error }}</pre>
+    </details>
+    {% endif %}
+  </section>
+
+  <div id="aviso-video" class="avisos" role="status" aria-live="polite"></div>
+  <div class="acciones-fila" hx-target="#aviso-video" hx-swap="innerHTML">
+    <button type="button" class="boton" hx-post="/video/{{ a.fingerprint }}/reprocesar" hx-confirm="¿Reprocesar este archivo?">Reprocesar</button>
+    <button type="button" class="boton" hx-post="/video/{{ a.fingerprint }}/detectar">Detectar idioma</button>
+  </div>
+
+  {% if detalle.error %}<p class="aviso">{{ detalle.error }}</p>{% endif %}
+  {% if detalle.plan %}<p class="tarjeta plan"><strong>Plan:</strong> {{ detalle.plan }}</p>{% endif %}
+
+  <h2>Audio</h2>
+  {% if detalle.audio %}
+  <ul class="pistas">
+    {% for p in detalle.audio %}
+    <li class="tarjeta pista">
+      <div class="pista-cabecera">
+        <span class="marca-pista {{ 'conserva' if p.se_conserva else 'quita' }}" title="{{ 'Se conserva' if p.se_conserva else 'Se quita' }}">{{ '✔' if p.se_conserva else '✂' }}</span>
+        <span>Pista {{ p.indice_absoluto }}</span>
+        <span class="suave">{{ p.codec or '?' }}{% if p.canales %} · {{ p.canales }} canal{{ "es" if p.canales != 1 }}{% endif %}</span>
+      </div>
+      <p class="suave">Etiqueta / detectado: {{ p.etiqueta or '—' }} / {{ p.detectado or '—' }}{% if p.titulo %} · título: {{ p.titulo }}{% endif %}</p>
+      {% if p.nombre %}<p class="suave">Nombre en el MP4: {{ p.nombre }}</p>{% endif %}
+      <form class="corregir" hx-post="/video/{{ a.fingerprint }}/idioma" hx-target="#aviso-video" hx-swap="innerHTML">
+        <input type="hidden" name="pista" value="{{ p.indice_absoluto }}">
+        <label class="suave" for="idioma-{{ p.indice_absoluto }}">Corregir idioma</label>
+        <select id="idioma-{{ p.indice_absoluto }}" name="idioma">
+          {% for i in idiomas %}<option value="{{ i }}"{% if i == p.idioma %} selected{% endif %}>{{ i }}</option>{% endfor %}
+        </select>
+        <button type="submit" class="boton">Corregir</button>
+      </form>
+    </li>
+    {% endfor %}
+  </ul>
+  {% else %}
+  <p class="suave">Sin pistas de audio.</p>
+  {% endif %}
+
+  <h2>Subtítulos</h2>
+  {% if detalle.subtitulos %}
+  <ul class="pistas">
+    {% for s in detalle.subtitulos %}
+    <li class="tarjeta pista">
+      <div class="pista-cabecera">
+        <span class="marca-pista {{ 'conserva' if s.se_conserva else 'quita' }}" title="{{ 'Se conserva' if s.se_conserva else 'Se quita' }}">{{ '✔' if s.se_conserva else '✂' }}</span>
+        <span>Subtítulo {{ s.indice }}</span>
+        <span class="suave">{{ s.codec or '?' }} · {{ s.etiqueta or '—' }}</span>
+      </div>
+    </li>
+    {% endfor %}
+  </ul>
+  {% else %}
+  <p class="suave">Sin subtítulos.</p>
+  {% endif %}
+  {% endif %}
+</div>
+{% endblock %}
