@@ -21,10 +21,12 @@ import re
 import sys
 import subprocess
 import shutil
+import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from mediajelly_emoji import EmojiGenerator
+import mediajelly_progreso as progreso
 
 # Importaciones opcionales con manejo de errores
 try:
@@ -55,6 +57,12 @@ WHISPER_FALLBACK_MODEL_NAME = "small"
 # Tope de las palabras de referencia (personajes, título) que se pasan al modelo
 MAX_HINT_CHARS = 400
 
+# Cada cuánto, como mínimo, se informa al panel la posición de la transcripción
+PROGRESO_INTERVALO_SEGUNDOS = 5.0
+# Latido: el avance solo cambia al llegar un segmento; si uno tarda, un hilo toca el
+# archivo cada tanto (sin mover la posición) para que el panel no lo vea "sin señal" (60 s)
+PROGRESO_LATIDO_SEGUNDOS = 30.0
+
 # Límites de un cue de subtítulo generado desde audio
 MAX_CUE_SECONDS = 7.0
 MIN_CUE_SECONDS = 1.0
@@ -77,6 +85,42 @@ import threading
 
 # Lock global para Whisper (solo un proceso a la vez)
 whisper_lock = threading.Lock()
+
+def referencias_nfo(nfo_video: Path) -> Tuple[List[str], List[str]]:
+    """Personajes (<role>) y títulos de los .nfo de un video: el suyo, movie.nfo y
+    el tvshow.nfo de la serie (en la carpeta o la de arriba, si es una temporada).
+
+    Los usan el transcriptor (palabras de referencia para Whisper) y el traductor
+    (nombres que no se traducen).
+
+    Args:
+        nfo_video: Ruta del .nfo del propio video (puede no existir).
+
+    Returns:
+        Tuple[List[str], List[str]]: (personajes, títulos) tal como vienen en los .nfo.
+    """
+    candidates = [
+        nfo_video,
+        nfo_video.parent / "movie.nfo",
+        nfo_video.parent / "tvshow.nfo",
+        nfo_video.parent.parent / "tvshow.nfo",
+    ]
+    roles: List[str] = []
+    titles: List[str] = []
+    for nfo in candidates:
+        try:
+            content = nfo.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        roles += re.findall(r"<role>([^<]+)</role>", content)
+        titles += re.findall(r"<(?:title|originaltitle)>([^<]+)</(?:title|originaltitle)>", content)
+    return roles, titles
+
+
+def limpiar_nombre_nfo(raw: str) -> str:
+    """'Piccolo (voice)' -> 'Piccolo'; decodifica &amp; y quita puntuación de los bordes."""
+    return re.sub(r"\s*\([^)]*\)", "", raw).replace("&amp;", "&").strip(" .,-") if raw else ""
+
 
 class WhisperAudioExtractorMixin:
     """Extracción de subtítulos desde audio mediante transcripción con Whisper."""
@@ -109,6 +153,7 @@ class WhisperAudioExtractorMixin:
 
             # Transcribir audio con Whisper
             self._transcription_hotwords = self._transcription_hints(video_file)
+            self._transcription_video = video_file
             transcription_result = self._transcribe_audio_with_whisper(audio_file)
             if not transcription_result:
                 return None
@@ -578,27 +623,13 @@ class WhisperAudioExtractorMixin:
         Returns:
             Optional[str]: Lista separada por comas (máx. MAX_HINT_CHARS) o None si no hay datos.
         """
-        candidates = [
-            video_file.with_suffix(".nfo"),
-            video_file.parent / "movie.nfo",
-            video_file.parent / "tvshow.nfo",
-            video_file.parent.parent / "tvshow.nfo",
-        ]
-        roles: List[str] = []
-        titles: List[str] = []
-        for nfo in candidates:
-            try:
-                content = nfo.read_text(encoding="utf-8", errors="ignore")
-            except OSError:
-                continue
-            roles += re.findall(r"<role>([^<]+)</role>", content)
-            titles += re.findall(r"<(?:title|originaltitle)>([^<]+)</(?:title|originaltitle)>", content)
+        roles, titles = referencias_nfo(video_file.with_suffix(".nfo"))
 
         hints: List[str] = []
         seen = set()
         # Primero los personajes: son lo que más se repite en los diálogos
         for raw in roles + titles:
-            name = re.sub(r"\s*\([^)]*\)", "", raw).replace("&amp;", "&").strip(" .,-")
+            name = limpiar_nombre_nfo(raw)
             if len(name) < 3 or name.lower() in seen:
                 continue
             seen.add(name.lower())
@@ -666,14 +697,34 @@ class WhisperAudioExtractorMixin:
             segments: List[Dict[str, Union[float, str]]] = []
             # Barra de progreso solo en ejecuciones manuales (terminal interactiva)
             show_progress = sys.stderr.isatty() and getattr(info, "duration", 0) > 0
-            for segment in segments_iter:
-                if show_progress:
-                    self._print_progress(segment.end, info.duration)
-                words = [(w.start, w.end, w.word) for w in (segment.words or [])]
-                if words:
-                    segments.extend(self._split_words_into_cues(words))
-                else:
-                    segments.append({"start": segment.start, "end": segment.end, "text": segment.text})
+            # Avance para el panel (accesorio: nunca interrumpe la transcripción)
+            video = getattr(self, "_transcription_video", None)
+            nombre = Path(video).name if video else Path(audio_file).name
+            progreso.iniciar("subtitulos", nombre, getattr(info, "duration", None), nombre)
+            ultimo_aviso = time.monotonic()
+            parar_latido = threading.Event()
+            latido = threading.Thread(
+                target=self._latido_progreso, args=(parar_latido,), name="latido-subtitulos", daemon=True
+            )
+            latido.start()
+            try:
+                for segment in segments_iter:
+                    if show_progress:
+                        self._print_progress(segment.end, info.duration)
+                    ahora = time.monotonic()
+                    if ahora - ultimo_aviso >= PROGRESO_INTERVALO_SEGUNDOS:
+                        progreso.actualizar("subtitulos", segment.end)
+                        ultimo_aviso = ahora
+                    words = [(w.start, w.end, w.word) for w in (segment.words or [])]
+                    if words:
+                        segments.extend(self._split_words_into_cues(words))
+                    else:
+                        segments.append({"start": segment.start, "end": segment.end, "text": segment.text})
+            finally:
+                # el latido se detiene antes de cerrar la etapa (actualizar no revive una terminada)
+                parar_latido.set()
+                latido.join(timeout=5)
+                progreso.terminar("subtitulos")
 
             if show_progress:
                 self._print_progress(info.duration, info.duration)
@@ -682,6 +733,12 @@ class WhisperAudioExtractorMixin:
         if not segments:
             return None
         return {"segments": segments, "language": info.language}
+
+    @staticmethod
+    def _latido_progreso(parar: threading.Event) -> None:
+        """Reescribe el avance de "subtitulos" sin cambiarlo hasta que se pida parar."""
+        while not parar.wait(PROGRESO_LATIDO_SEGUNDOS):
+            progreso.actualizar("subtitulos")
 
     @staticmethod
     def _print_progress(position: float, total: float, width: int = 40) -> None:

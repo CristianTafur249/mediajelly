@@ -42,6 +42,7 @@ from mediajelly_db import (
     migration_pending,
     MIGRATION_PENDING_MESSAGE,
 )
+import mediajelly_progreso as progreso
 import mediajelly_retag
 from mediajelly_retag import retag_audio
 
@@ -769,8 +770,17 @@ def detect_language_with_whisper(model, audio_file: str) -> Tuple[Optional[str],
         return None, {}
 
 
+def _avisar_muestra(contexto: str, muestra: int, total: int, stream_index: int) -> None:
+    """Actualiza el detalle de la etapa "idiomas" (solo dentro del lote, que la inició).
+
+    Cada archivo tarda minutos: sin esto el panel lo vería "sin señal" a los 60 s.
+    """
+    if contexto:
+        progreso.actualizar("idiomas", detalle=f"muestra {muestra} de {total}, pista {stream_index} · {contexto}")
+
+
 def detect_language_with_multiple_samples(
-    model, file_path: Union[str, Path], stream_index: int, total_duration: float
+    model, file_path: Union[str, Path], stream_index: int, total_duration: float, contexto: str = ""
 ) -> Optional[str]:
     """
     Detecta el idioma usando múltiples muestras aleatorias y votación.
@@ -783,6 +793,7 @@ def detect_language_with_multiple_samples(
         file_path: Ruta del archivo multimedia.
         stream_index: Índice del stream de audio.
         total_duration: Duración total del archivo en segundos.
+        contexto: "archivo X de N" del lote; si viene, cada muestra actualiza el avance.
 
     Returns:
         Optional[str]: Código ISO 639-2 (3 letras), o None si no se pudo analizar
@@ -790,7 +801,7 @@ def detect_language_with_multiple_samples(
     """
     if total_duration < 60:
         log(f"Archivo muy corto ({total_duration:.1f}s), usando muestra única", "WARNING")
-        return detect_single_sample(model, file_path, stream_index, total_duration)
+        return detect_single_sample(model, file_path, stream_index, total_duration, contexto)
 
     # Calcular número de muestras (máximo 15, duración 30s cada una)
     num_samples = min(15, int(total_duration / 30))
@@ -810,6 +821,7 @@ def detect_language_with_multiple_samples(
     temp_files = []
 
     for i, timestamp in enumerate(timestamps, 1):
+        _avisar_muestra(contexto, i, num_samples, stream_index)
         temp_audio = extract_audio_sample(file_path, stream_index, timestamp, 30)
 
         if not temp_audio:
@@ -876,7 +888,7 @@ def detect_language_with_multiple_samples(
 
 
 def detect_single_sample(
-    model, file_path: Union[str, Path], stream_index: int, total_duration: float
+    model, file_path: Union[str, Path], stream_index: int, total_duration: float, contexto: str = ""
 ) -> Optional[str]:
     """
     Detecta el idioma usando una única muestra (para archivos cortos).
@@ -891,6 +903,7 @@ def detect_single_sample(
         str: Código de idioma detectado en formato ISO 639-2.
     """
     start_time = min(10, total_duration / 2) if total_duration > 15 else 0
+    _avisar_muestra(contexto, 1, 1, stream_index)
 
     temp_audio = extract_audio_sample(file_path, stream_index, start_time, min(30, total_duration))
 
@@ -1061,59 +1074,68 @@ def process_files(files_to_analyze: List[Dict[str, Any]], cache: Dict[str, Any])
         log("No se pudo cargar Whisper, abortando análisis", "ERROR")
         return cache
 
-    # Procesar cada archivo
-    for idx, file_info in enumerate(files_to_analyze, 1):
-        absolute_path = file_info["absolute_path"]
-        relative_path = file_info["relative_path"]
-        streams = file_info["streams"]
+    # Procesar cada archivo (el avance de la etapa se cierra pase lo que pase)
+    try:
+        for idx, file_info in enumerate(files_to_analyze, 1):
+            absolute_path = file_info["absolute_path"]
+            relative_path = file_info["relative_path"]
+            streams = file_info["streams"]
 
-        log(f"\n{'='*80}", "INFO")
-        log(f"[{idx}/{len(files_to_analyze)}] {os.path.basename(absolute_path)}", "INFO")
-        log(f"{'='*80}", "INFO")
+            log(f"\n{'='*80}", "INFO")
+            log(f"[{idx}/{len(files_to_analyze)}] {os.path.basename(absolute_path)}", "INFO")
+            log(f"{'='*80}", "INFO")
+            progreso.iniciar(
+                "idiomas", os.path.basename(absolute_path), None, f"archivo {idx} de {len(files_to_analyze)}"
+            )
 
-        # Inicializar entrada en caché usando ruta absoluta resuelta
-        if absolute_path not in cache:
-            cache[absolute_path] = {}
+            # Inicializar entrada en caché usando ruta absoluta resuelta
+            if absolute_path not in cache:
+                cache[absolute_path] = {}
 
-        detected_in_file: Dict[int, str] = dict(file_info.get("known") or {})
-        undetected = False
+            detected_in_file: Dict[int, str] = dict(file_info.get("known") or {})
+            undetected = False
 
-        # Analizar cada stream
-        for stream_index, codec, duration in streams:
-            log(f"\n🎙️ Analizando stream {stream_index} ({codec}, {duration:.1f}s)...", "DETECT")
+            # Analizar cada stream
+            for stream_index, codec, duration in streams:
+                log(f"\n🎙️ Analizando stream {stream_index} ({codec}, {duration:.1f}s)...", "DETECT")
 
-            # Verificar cache primero
-            cached_lang = get_cached_language(absolute_path, stream_index)
-            if cached_lang:
-                detected_lang = cached_lang
-                log(f"Stream {stream_index}: {detected_lang} (cacheado)", "SUCCESS")
-            else:
-                detected_lang = detect_language_with_multiple_samples(model, absolute_path, stream_index, duration)
-                if not detected_lang:
-                    # Sin guardar: un pendiente se reintenta en la próxima corrida;
-                    # uno terminado espera LANGUAGE_RETRY_DAYS días (ver abajo)
-                    log(f"Stream {stream_index}: idioma no detectado", "WARNING")
-                    undetected = True
-                    continue
-                set_cached_language(absolute_path, stream_index, detected_lang)
-                log(f"Stream {stream_index}: {detected_lang}", "SUCCESS")
+                # Verificar cache primero
+                cached_lang = get_cached_language(absolute_path, stream_index)
+                if cached_lang:
+                    detected_lang = cached_lang
+                    log(f"Stream {stream_index}: {detected_lang} (cacheado)", "SUCCESS")
+                else:
+                    detected_lang = detect_language_with_multiple_samples(
+                        model, absolute_path, stream_index, duration,
+                        contexto=f"archivo {idx} de {len(files_to_analyze)}",
+                    )
+                    if not detected_lang:
+                        # Sin guardar: un pendiente se reintenta en la próxima corrida;
+                        # uno terminado espera LANGUAGE_RETRY_DAYS días (ver abajo)
+                        log(f"Stream {stream_index}: idioma no detectado", "WARNING")
+                        undetected = True
+                        continue
+                    set_cached_language(absolute_path, stream_index, detected_lang)
+                    log(f"Stream {stream_index}: {detected_lang}", "SUCCESS")
 
-            detected_in_file[stream_index] = normalize_lang(detected_lang)
-            # Compatibilidad: la fuente de verdad es la BD; el dict solo refleja la corrida
-            cache[absolute_path][str(stream_index)] = detected_lang
+                detected_in_file[stream_index] = normalize_lang(detected_lang)
+                # Compatibilidad: la fuente de verdad es la BD; el dict solo refleja la corrida
+                cache[absolute_path][str(stream_index)] = detected_lang
 
-        # Terminado con alguna pista sin detectar: no se vuelve a pasar por Whisper en cada ciclo
-        if undetected:
-            try:
-                record = get_by_path(absolute_path)
-                if record is not None and record.status in ("done", "skipped"):
-                    record_language_attempt(record.fingerprint)
-            except Exception as e:
-                log(f"Error anotando el intento de detección de {absolute_path}: {e}", "WARNING")
+            # Terminado con alguna pista sin detectar: no se vuelve a pasar por Whisper en cada ciclo
+            if undetected:
+                try:
+                    record = get_by_path(absolute_path)
+                    if record is not None and record.status in ("done", "skipped"):
+                        record_language_attempt(record.fingerprint)
+                except Exception as e:
+                    log(f"Error anotando el intento de detección de {absolute_path}: {e}", "WARNING")
 
-        # Si el archivo ya está procesado, escribir la etiqueta de inmediato
-        if detected_in_file:
-            retag_if_processed(absolute_path, detected_in_file)
+            # Si el archivo ya está procesado, escribir la etiqueta de inmediato
+            if detected_in_file:
+                retag_if_processed(absolute_path, detected_in_file)
+    finally:
+        progreso.terminar("idiomas")
 
     return cache
 

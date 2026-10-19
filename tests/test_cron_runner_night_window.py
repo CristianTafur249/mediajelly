@@ -190,3 +190,27 @@ def test_job_that_finished_early_is_not_reported_as_cut(runner, tmp_path):
 
     assert runner._finish_background(job) == 0
     assert not job.timed_out.is_set()
+
+
+def test_release_lock_keeps_the_file_and_frees_the_flock(runner, tmp_path):
+    """Borrar el archivo deja el flock en un inodo huérfano: otro proceso que ya lo
+    abrió y el que lo cree de nuevo podrían tener "el lock" a la vez."""
+    import fcntl
+    import os
+
+    lock = tmp_path / "cron_runner.lock"
+    fd = os.open(str(lock), os.O_RDWR | os.O_CREAT, 0o644)
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    runner.lock_file = lock
+    runner._lock_fd = fd
+
+    runner._release_lock()
+
+    assert lock.exists()
+    with pytest.raises(OSError):
+        os.fstat(fd)  # descriptor cerrado
+    otro = os.open(str(lock), os.O_RDWR)
+    try:
+        fcntl.flock(otro, fcntl.LOCK_EX | fcntl.LOCK_NB)  # libre
+    finally:
+        os.close(otro)

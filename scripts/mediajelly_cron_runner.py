@@ -23,6 +23,7 @@ from mediajelly_utils import MediaJellyPaths, archive_legacy_log_file, create_co
 sys.path.insert(0, str(Path(__file__).parent))
 
 from mediajelly_db import MIGRATION_PENDING_MESSAGE, migration_pending
+import mediajelly_progreso as progreso
 
 # Importar módulos directamente para evitar subprocess overhead
 try:
@@ -479,7 +480,12 @@ class MediaJellyCron:
             return False
 
     def _release_lock(self) -> None:
-        """Libera el archivo de bloqueo"""
+        """Libera el flock y cierra el descriptor.
+
+        El archivo no se borra: si se borrara, quien ya lo tuviera abierto (p. ej.
+        mediajelly_tareas.py) tomaría el flock de un inodo huérfano mientras otro
+        proceso crea un archivo nuevo y toma el suyo, y los dos correrían a la vez.
+        """
         try:
             # Cerrar descriptor de lock si fue usado (flock)
             if getattr(self, "_lock_fd", None):
@@ -487,8 +493,7 @@ class MediaJellyCron:
                     os.close(self._lock_fd)
                 except Exception:
                     pass
-            if self.lock_file.exists():
-                self.lock_file.unlink()
+                self._lock_fd = None
             print("Lock liberado después del procesamiento")
         except Exception as e:
             print(f"Error liberando lock: {e}")
@@ -507,14 +512,12 @@ class MediaJellyCron:
         Returns:
             bool: True si el ciclo completo fue exitoso.
         """
-        # Función para limpiar el lock en caso de señales
+        # Ante una señal no se borra el archivo del lock: el ciclo sigue con el flock
+        # tomado y borrarlo dejaría a otro proceso tomar uno nuevo a la vez (ver
+        # _release_lock). El kernel suelta el flock cuando el proceso termina.
         def cleanup_lock(signum=None, frame=None):
-            if self.lock_file.exists():
-                try:
-                    self.lock_file.unlink()
-                    print(f"Lock limpiado por señal {signum}" if signum else "Lock limpiado")
-                except Exception as e:
-                    print(f"Error limpiando lock: {e}")
+            print(f"Señal {signum} recibida; el lock se suelta al terminar" if signum
+                  else "Señal recibida; el lock se suelta al terminar")
 
         # Registrar manejadores de señales para limpieza del lock
         signal.signal(signal.SIGTERM, cleanup_lock)
@@ -532,6 +535,7 @@ class MediaJellyCron:
                 return False
 
             # Paso 1: Ejecutar scanner siempre
+            progreso.fase("escaneo")
             if not self.run_scanner():
                 self.logger.error("Error en scanner, saltando procesamiento")
                 return False
@@ -545,6 +549,7 @@ class MediaJellyCron:
 
             # Ejecutar detector de idiomas ANTES del procesador para que el processor pueda usar la cache
             self.logger.info(f"{EmojiGenerator.audio()} Ejecutando análisis de idiomas antes del procesamiento...")
+            progreso.fase("idiomas")
             detector_ok = self.run_language_detector()
 
             # Si el detector falló, registramos warning pero continuamos con el processor
@@ -559,11 +564,14 @@ class MediaJellyCron:
             else:
                 self.logger.info(f"Es de día ({current_time}) - Ejecutando solo compresión")
 
+            # De noche los subtítulos corren en segundo plano: la fase es la que el ciclo espera
+            progreso.fase("compresion")
             processor_ok = self.run_processor()
             if not processor_ok:
                 self.logger.error("Error en processor")
 
             if is_night:
+                progreso.fase("subtitulos")
                 if not self._finish_subtitle_translator(subtitle_job):
                     self.logger.warning("Error en traductor de subtítulos")
                 subtitle_job = None
@@ -580,14 +588,17 @@ class MediaJellyCron:
             self.logger.info("Ciclo completado exitosamente")
             return True
         finally:
-            # No dejar trabajos en segundo plano sin recoger, pase lo que pase en el ciclo
-            self._finish_subtitle_translator(subtitle_job)
-            self._finish_nfo_translator(nfo_job)
-            # Forzar flush de logs antes de salir
-            for handler in self.logger.handlers:
-                handler.flush()
-            # El lock se libera solo cuando todas las etapas terminaron
-            self._release_lock()
+            try:
+                # No dejar trabajos en segundo plano sin recoger, pase lo que pase en el ciclo
+                self._finish_subtitle_translator(subtitle_job)
+                self._finish_nfo_translator(nfo_job)
+                # Forzar flush de logs antes de salir
+                for handler in self.logger.handlers:
+                    handler.flush()
+                # El lock se libera solo cuando todas las etapas terminaron
+                self._release_lock()
+            finally:
+                progreso.fase(None)
 
 
 def main():

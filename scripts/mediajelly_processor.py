@@ -47,6 +47,16 @@ from mediajelly_exceptions import (
     LanguageDetectionError,
 )
 from mediajelly_utils import MediaJellyPaths, create_compressed_rotating_file_handler
+import mediajelly_progreso as progreso
+from mediajelly_politica import (
+    UHD_HEIGHT_THRESHOLD,  # noqa: F401 (se reexportan con el nombre de siempre)
+    UHD_WIDTH_THRESHOLD,  # noqa: F401
+    elegir_subtitulos,
+    es_anime,
+    es_uhd,
+    omitir_subtitulos,
+    planificar_pistas,
+)
 from mediajelly_filename_normalizer import FilenameNormalizerMixin
 from mediajelly_pending_files import PendingFilesMixin
 from mediajelly_language_detection import LanguageDetectionMixin
@@ -87,8 +97,7 @@ MAX_MEMORY_GB = 4
 # (lookahead + buffers de frame escalan con la resolución); con 4GB el
 # fallback CPU falla con "malloc failed" en archivos 2160p.
 MAX_MEMORY_GB_UHD = 10
-UHD_WIDTH_THRESHOLD = 3800   # cubre 3840x2160 (2160p) y variantes cercanas
-UHD_HEIGHT_THRESHOLD = 2000
+# UHD_WIDTH_THRESHOLD y UHD_HEIGHT_THRESHOLD viven en mediajelly_politica.
 # El contenido 4K/UHD se reduce a 1080p al comprimir: el Roku Express no
 # decodifica 2160p y Jellyfin no reescala al transcodificar, así que un
 # archivo 4K simplemente no reproduce.
@@ -1078,10 +1087,7 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
         """True si la resolución detectada corresponde a 4K/UHD (2160p+)."""
         if not resolution:
             return False
-        return (
-            resolution.get("width", 0) >= UHD_WIDTH_THRESHOLD
-            or resolution.get("height", 0) >= UHD_HEIGHT_THRESHOLD
-        )
+        return es_uhd(resolution.get("width", 0), resolution.get("height", 0))
 
     def _is_10bit_pix_fmt(self, resolution: Optional[Dict[str, Any]]) -> bool:
         """True si el pix_fmt detectado es de 10 bits (yuv420p10le, p010le,
@@ -1132,6 +1138,74 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
         filters.append("format=yuv420p")
         return ",".join(filters)
 
+    def _map_text_subtitles(
+        self,
+        ffmpeg_cmd: List[str],
+        sub_indices: List[int],
+        subtitle_codecs: List[str],
+        omitir_subtitulos: bool = False,
+    ) -> int:
+        """Agrega a ffmpeg_cmd los -map de los subtítulos de texto elegidos y devuelve cuántos son.
+
+        La elección la hace mediajelly_politica.elegir_subtitulos: ninguno si el
+        plan omite los subtítulos (archivo grande o UHD); si no, los de español
+        que sean de texto o, si no hay ninguno en español, el primer subtítulo
+        de texto disponible. PGS y demás subtítulos de imagen no se pueden
+        convertir a mov_text.
+        """
+        elegidos = elegir_subtitulos(sub_indices, subtitle_codecs, omitir=omitir_subtitulos)
+        if omitir_subtitulos:
+            # Ninguno incrustado; el .srt externo no cambia.
+            self.logger.debug("Archivo grande/UHD: no se mapea ningún subtítulo incrustado")
+        elif sub_indices:
+            for idx in sub_indices:
+                if idx in elegidos:
+                    continue
+                codec = subtitle_codecs[idx] if idx < len(subtitle_codecs) else None
+                self.logger.warning(f"Omitiendo subtítulo 0:s:{idx} (codec={codec}) - no apto para remux a mov_text")
+        elif not elegidos:
+            self.logger.debug("No se encontraron subtítulos textuales a mapear; omitiendo subtítulos")
+        for idx in elegidos:
+            ffmpeg_cmd.extend(["-map", f"0:s:{idx}?"])
+        return len(elegidos)
+
+    def _codec_subtitulos_args(
+        self, sub_indices: List[int], subtitle_codecs: List[str], omitir_subtitulos: bool = False
+    ) -> List[str]:
+        """-c:s:K de cada subtítulo mapeado: copy si ya es mov_text, si no mov_text.
+
+        Recodificar un mov_text lo pasa a microsegundos y un subtítulo de más
+        de ~35 min (p. ej. el hueco entre subtítulos forzados) supera el máximo
+        del MP4: "Application provided duration ... is invalid" y la compresión
+        falla al final (Jason Bourne). Copiarlo conserva sus tiempos originales.
+        """
+        elegidos = elegir_subtitulos(sub_indices, subtitle_codecs, omitir=omitir_subtitulos)
+        args = []
+        for salida, idx in enumerate(elegidos):
+            codec = (subtitle_codecs[idx] if idx < len(subtitle_codecs) else "") or ""
+            args.extend([f"-c:s:{salida}", "copy" if codec.lower() == "mov_text" else "mov_text"])
+        return args
+
+    @staticmethod
+    def _es_error_de_subtitulos(stderr: Optional[str]) -> bool:
+        """True si ffmpeg falló por un subtítulo: se reintenta sin subtítulos incrustados."""
+        if not stderr:
+            return False
+        return ("Could not find codec parameters" in stderr
+                or "Application provided duration" in stderr)
+
+    def _nombre_audio_args(self, salida: int, idx: int, nombres_audio: Optional[Dict[int, str]]) -> List[str]:
+        """Nombre de la pista de salida (variante regional o título original).
+
+        El MP4 descarta el título de una pista y solo guarda el idioma como
+        ISO 639-2; el nombre va en handler_name, que es lo que conserva y lo que
+        muestran Jellyfin y el Roku ("Español (Latinoamérica)").
+        """
+        nombre = (nombres_audio or {}).get(idx)
+        if not nombre:
+            return []
+        return [f"-metadata:s:a:{salida}", f"handler_name={nombre}", f"-metadata:s:a:{salida}", f"title={nombre}"]
+
     def _build_remux_command(
         self,
         file_path: Path,
@@ -1139,6 +1213,8 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
         audio_indices: List[int],
         sub_indices: List[int],
         audio_languages: Optional[Dict[int, str]] = None,
+        omitir_subtitulos: bool = False,
+        nombres_audio: Optional[Dict[int, str]] = None,
     ) -> List[str]:
         """Construye comando ffmpeg para remux (sin recodificación) - Para archivos AV1"""
         if audio_languages is None:
@@ -1172,43 +1248,50 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
         if audio_languages:
             self.logger.debug(f"{EmojiGenerator.clipboard()} Remux: idiomas de audio para metadata: {audio_languages}")
 
-        # Intentar detectar códec y canales del primer stream de audio mapeado
+        # Detectar el códec de las pistas de audio que se mapean (un solo
+        # ffprobe para todas). El -c:a vale para todas: se copia solo si TODAS
+        # son AAC. Se pide también el index para que cada línea sea una pista
+        # aunque el códec venga vacío (la posición es el índice relativo).
         detected_codec = ""
-        detected_channels = 2
         try:
-            probe_idx = audio_indices[0] if audio_indices else 0
             probe_cmd = [
                 "ffprobe",
                 "-v",
                 "error",
                 "-select_streams",
-                f"a:{probe_idx}",
+                "a",
                 "-show_entries",
-                "stream=codec_name,channels",
+                "stream=index,codec_name",
                 "-of",
-                "default=noprint_wrappers=1:nokey=1",
+                "csv=p=0",
                 str(file_path),
             ]
             probe_res = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=SHORT_TIMEOUT)
-            probe_lines = [l.strip() for l in probe_res.stdout.splitlines() if l.strip()]
-            if len(probe_lines) >= 1:
-                detected_codec = probe_lines[0].lower()
-            if len(probe_lines) >= 2 and probe_lines[1].isdigit():
-                detected_channels = int(probe_lines[1])
-            self.logger.debug(f"Detected audio codec={detected_codec} channels={detected_channels} for {file_path.name}")
+            codecs_audio = []
+            for linea in probe_res.stdout.splitlines():
+                if not linea.strip():
+                    continue
+                partes = [p.strip() for p in linea.split(",")]
+                codecs_audio.append(partes[1].lower() if len(partes) > 1 else "")
+            elegidos = [codecs_audio[i] for i in (audio_indices or [0]) if i < len(codecs_audio)]
+            if elegidos:
+                otros = [codec for codec in elegidos if codec != "aac"]
+                detected_codec = otros[0] if otros else "aac"
+            self.logger.debug(f"Detected audio codec={detected_codec} for {file_path.name}")
         except Exception:
             detected_codec = ""
-            detected_channels = 2
 
         for idx in audio_indices:
             ffmpeg_cmd.extend(["-map", f"0:a:{idx}"])
             # Aplicar etiqueta de idioma si está disponible
             if idx in audio_languages:
                 ffmpeg_cmd.extend([f"-metadata:s:a:{audio_map_count}", f"language={audio_languages[idx]}"])
+            ffmpeg_cmd.extend(self._nombre_audio_args(audio_map_count, idx, nombres_audio))
             audio_map_count += 1
 
         if not audio_indices:
             ffmpeg_cmd.extend(["-map", "0:a:0"])
+            ffmpeg_cmd.extend(self._nombre_audio_args(0, 0, nombres_audio))
             if 0 in audio_languages:
                 lang_code = audio_languages[0]
                 self.logger.info(f"  Aplicando metadata language={lang_code} al audio stream 0")
@@ -1216,14 +1299,12 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
             else:
                 self.logger.warning(f"  No hay idioma disponible para audio stream 0")
 
-        # Decidir si copiar audio o recodificar a AAC para compatibilidad MP4
-        # Copiar solo si ya es AAC; en otros casos recodificar a AAC (preservando canales cuando sea posible)
+        # Copiar el audio solo si todas las pistas ya son AAC; si no, AAC
+        # estéreo para todas, igual que los constructores GPU y CPU.
         if detected_codec == "aac":
             ffmpeg_cmd.extend(["-c:a", "copy"])
         else:
-            target_channels = str(detected_channels if detected_channels and detected_channels <= 6 else 2)
-            target_bitrate = "384k" if detected_channels >= 6 else "256k"
-            ffmpeg_cmd.extend(["-c:a", "aac", "-b:a", target_bitrate, "-ac", target_channels, "-ar", "48000"])
+            ffmpeg_cmd.extend(["-c:a", "aac", "-b:a", "256k", "-ac", "2", "-ar", "48000"])
 
         # Subtítulos: mapear SOLO subtítulos textuales (subrip/ass/etc.).
         # Evitar PGS (hdmv_pgs_subtitle) ya que no se pueden convertir a mov_text.
@@ -1246,32 +1327,11 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
         except Exception:
             subtitle_codecs = []
 
-        # Definir codecs textuales que podemos convertir a mov_text
-        text_sub_codecs = {"subrip", "srt", "ass", "ssa", "webvtt", "mov_text"}
+        mapped_subs += self._map_text_subtitles(ffmpeg_cmd, sub_indices, subtitle_codecs, omitir_subtitulos)
 
-        if sub_indices:
-            for idx in sub_indices:
-                codec = subtitle_codecs[idx] if idx < len(subtitle_codecs) else None
-                if codec and codec.lower() in text_sub_codecs:
-                    ffmpeg_cmd.extend(["-map", f"0:s:{idx}?"])
-                    mapped_subs += 1
-                else:
-                    self.logger.warning(f"Omitiendo subtítulo 0:s:{idx} (codec={codec}) - no apto para remux a mov_text")
-        else:
-            # Intentar mapear el primer subtítulo textual disponible
-            mapped = False
-            for i, codec in enumerate(subtitle_codecs):
-                if codec and codec.lower() in text_sub_codecs:
-                    ffmpeg_cmd.extend(["-map", f"0:s:{i}?"])
-                    mapped_subs += 1
-                    mapped = True
-                    break
-            if not mapped:
-                self.logger.debug("No se encontraron subtítulos textuales a mapear; omitiendo subtítulos")
-
-        # Añadir conversión solo si se mapearon subtítulos
+        # Subtítulos: mov_text se copia; el resto se convierte a mov_text
         if mapped_subs > 0:
-            ffmpeg_cmd.extend(["-c:s", "mov_text"])
+            ffmpeg_cmd.extend(self._codec_subtitulos_args(sub_indices, subtitle_codecs, omitir_subtitulos))
 
         # Copiar metadatos
         ffmpeg_cmd.extend(["-map_metadata", "0"])
@@ -1291,6 +1351,8 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
         audio_languages: Optional[Dict[int, str]] = None,
         resolution: Optional[Dict[str, Any]] = None,
         threads: Optional[int] = None,
+        omitir_subtitulos: bool = False,
+        nombres_audio: Optional[Dict[int, str]] = None,
     ) -> List[str]:
         """Construye comando ffmpeg optimizado"""
         if audio_languages is None:
@@ -1373,9 +1435,11 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
                 # Aplicar etiqueta de idioma si está disponible
                 if idx in audio_languages:
                     ffmpeg_cmd.extend([f"-metadata:s:a:{audio_map_count}", f"language={audio_languages[idx]}"])
+                ffmpeg_cmd.extend(self._nombre_audio_args(audio_map_count, idx, nombres_audio))
                 audio_map_count += 1
         else:
             ffmpeg_cmd.extend(["-map", "0:a:0"])  # Primer audio
+            ffmpeg_cmd.extend(self._nombre_audio_args(0, 0, nombres_audio))
             # Aplicar etiqueta de idioma al primer audio si está disponible
             if 0 in audio_languages:
                 lang_code = audio_languages[0]
@@ -1404,33 +1468,14 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
         except Exception:
             subtitle_codecs = []
 
-        text_sub_codecs = {"subrip", "srt", "ass", "ssa", "webvtt", "mov_text"}
-
-        if sub_indices:
-            for idx in sub_indices:
-                codec = subtitle_codecs[idx] if idx < len(subtitle_codecs) else None
-                if codec and codec.lower() in text_sub_codecs:
-                    ffmpeg_cmd.extend(["-map", f"0:s:{idx}?"])
-                    mapped_subs += 1
-                else:
-                    self.logger.warning(f"Omitiendo subtítulo 0:s:{idx} (codec={codec}) - no apto para remux a mov_text")
-        else:
-            mapped = False
-            for i, codec in enumerate(subtitle_codecs):
-                if codec and codec.lower() in text_sub_codecs:
-                    ffmpeg_cmd.extend(["-map", f"0:s:{i}?"])
-                    mapped_subs += 1
-                    mapped = True
-                    break
-            if not mapped:
-                self.logger.debug("No se encontraron subtítulos textuales a mapear; omitiendo subtítulos")
+        mapped_subs += self._map_text_subtitles(ffmpeg_cmd, sub_indices, subtitle_codecs, omitir_subtitulos)
 
         # Audio config
         ffmpeg_cmd.extend(["-c:a", "aac", "-b:a", "256k", "-ac", "2", "-ar", "48000"])
 
-        # Subtítulos config: convertir a mov_text solo si se mapearon subtítulos textuales
+        # Subtítulos: mov_text se copia; el resto se convierte a mov_text
         if mapped_subs > 0:
-            ffmpeg_cmd.extend(["-c:s", "mov_text"])
+            ffmpeg_cmd.extend(self._codec_subtitulos_args(sub_indices, subtitle_codecs, omitir_subtitulos))
 
         # Copiar metadatos principales
         ffmpeg_cmd.extend(["-map_metadata", "0"])
@@ -1450,6 +1495,8 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
         audio_languages: Optional[Dict[int, str]] = None,
         threads: Optional[int] = None,
         resolution: Optional[Dict[str, Any]] = None,
+        omitir_subtitulos: bool = False,
+        nombres_audio: Optional[Dict[int, str]] = None,
     ) -> List[str]:
         """Construye comando ffmpeg fallback sin aceleración de hardware"""
         if audio_languages is None:
@@ -1489,9 +1536,11 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
                 # Aplicar etiqueta de idioma si está disponible
                 if idx in audio_languages:
                     ffmpeg_cmd.extend([f"-metadata:s:a:{audio_map_count}", f"language={audio_languages[idx]}"])
+                ffmpeg_cmd.extend(self._nombre_audio_args(audio_map_count, idx, nombres_audio))
                 audio_map_count += 1
         else:
             ffmpeg_cmd.extend(["-map", "0:a:0"])  # Primer audio
+            ffmpeg_cmd.extend(self._nombre_audio_args(0, 0, nombres_audio))
             # Aplicar etiqueta de idioma al primer audio si está disponible
             if 0 in audio_languages:
                 lang_code = audio_languages[0]
@@ -1519,34 +1568,16 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
         except Exception:
             subtitle_codecs = []
 
-        text_sub_codecs = {"subrip", "srt", "ass", "ssa", "webvtt", "mov_text"}
         mapped_subs = 0
 
-        if sub_indices:
-            for idx in sub_indices:
-                codec = subtitle_codecs[idx] if idx < len(subtitle_codecs) else None
-                if codec and codec.lower() in text_sub_codecs:
-                    ffmpeg_cmd.extend(["-map", f"0:s:{idx}?"])
-                    mapped_subs += 1
-                else:
-                    self.logger.warning(f"Omitiendo subtítulo 0:s:{idx} (codec={codec}) - no apto para remux a mov_text")
-        else:
-            mapped = False
-            for i, codec in enumerate(subtitle_codecs):
-                if codec and codec.lower() in text_sub_codecs:
-                    ffmpeg_cmd.extend(["-map", f"0:s:{i}?"])
-                    mapped_subs += 1
-                    mapped = True
-                    break
-            if not mapped:
-                self.logger.debug("No se encontraron subtítulos textuales a mapear; omitiendo subtítulos")
+        mapped_subs += self._map_text_subtitles(ffmpeg_cmd, sub_indices, subtitle_codecs, omitir_subtitulos)
 
         # Audio config
         ffmpeg_cmd.extend(["-c:a", "aac", "-b:a", "256k", "-ac", "2", "-ar", "48000"])
 
-        # Subtítulos config: convertir a mov_text solo si se mapearon subtítulos textuales
+        # Subtítulos: mov_text se copia; el resto se convierte a mov_text
         if mapped_subs > 0:
-            ffmpeg_cmd.extend(["-c:s", "mov_text"])
+            ffmpeg_cmd.extend(self._codec_subtitulos_args(sub_indices, subtitle_codecs, omitir_subtitulos))
 
         # Copiar metadatos principales
         ffmpeg_cmd.extend(["-map_metadata", "0"])
@@ -1565,6 +1596,7 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
         audio_languages: Optional[Dict[int, str]] = None,
         threads: Optional[int] = None,
         resolution: Optional[Dict[str, Any]] = None,
+        nombres_audio: Optional[Dict[int, str]] = None,
     ) -> List[str]:
         """Construye comando ffmpeg sin subtítulos para archivos con subtítulos corruptos"""
         if audio_languages is None:
@@ -1606,9 +1638,11 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
                 ffmpeg_cmd.extend(["-map", f"0:a:{idx}"])
                 if idx in audio_languages:
                     ffmpeg_cmd.extend([f"-metadata:s:a:{audio_map_count}", f"language={audio_languages[idx]}"])
+                ffmpeg_cmd.extend(self._nombre_audio_args(audio_map_count, idx, nombres_audio))
                 audio_map_count += 1
         else:
             ffmpeg_cmd.extend(["-map", "0:a:0"])
+            ffmpeg_cmd.extend(self._nombre_audio_args(0, 0, nombres_audio))
             if 0 in audio_languages:
                 lang_code = audio_languages[0]
                 self.logger.info(f"  Aplicando metadata language={lang_code} al audio stream 0")
@@ -2231,9 +2265,11 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
                 self._log_no_spanish_info(file_path, audio_indices, sub_indices)
 
             # Ejecuta compresión (aislada) - ahora pasa audio_languages también
+            omitir_subs = compression_info.get("omitir_subtitulos", False)
+            nombres_audio = compression_info.get("nombres_audio") or {}
             process, elapsed_time = self._execute_compression_attempt(
                 file_path, temp_output, use_gpu, audio_indices, sub_indices, use_remux, audio_languages,
-                resolution=resolution,
+                resolution=resolution, omitir_subtitulos=omitir_subs, nombres_audio=nombres_audio,
             )
 
             # Procesa resultado inicial
@@ -2253,6 +2289,8 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
                 audio_languages,
                 use_remux=use_remux,
                 resolution=resolution,
+                omitir_subtitulos=omitir_subs,
+                nombres_audio=nombres_audio,
             )
 
             result.update(compression_result)
@@ -2366,49 +2404,27 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
         )
 
         # -----------------------------------------------------------------
-        # NUEVA LÓGICA: FILTRAR A UN SOLO STREAM DE AUDIO SEGÚN PRIORIDAD
-        # Y OPCIONALMENTE OMITIR SUBTÍTULOS PARA AHORRAR MEMORIA
+        # AUDIO: TODO EL ESPAÑOL; SI NO HAY, UNA SOLA PISTA (ANIME -> JAPONÉS,
+        # SI NO INGLÉS; RESTO -> INGLÉS; SI NO, LA 0). EN ARCHIVOS GRANDES
+        # (>5 GB) O UHD, NINGÚN SUBTÍTULO INCRUSTADO PARA AHORRAR MEMORIA.
+        # La decisión vive en mediajelly_politica para que el panel muestre
+        # exactamente lo mismo.
         # -----------------------------------------------------------------
-        # 1. Determinar si es anime por la ruta
-        is_anime = 'anime' in str(file_path).lower()
-
-        # 2. Definir prioridad de idiomas: para anime, español > japonés > inglés > cualquiera
-        #    para no anime, español > inglés > cualquiera
-        if is_anime:
-            priority_langs = [ 'spa', 'es','jpn', 'ja', 'esp', 'eng', 'en']
-        else:
-            priority_langs = ['spa', 'es', 'esp', 'eng', 'en']
-
-        # 3. Función de prioridad
-        def audio_priority(idx: int) -> int:
-            lang = audio_languages.get(idx, '').lower()
-            for i, prio in enumerate(priority_langs):
-                if lang.startswith(prio) or lang == prio:
-                    return i
-            return len(priority_langs)  # cualquier otro idioma al final
-
-        # 4. Si hay pistas de audio, ordenar por prioridad y elegir la primera
-        if audio_indices:
-            audio_indices_sorted = sorted(audio_indices, key=audio_priority)
-            selected_audio = audio_indices_sorted[0]
-            audio_indices = [selected_audio]
-            # Filtrar el diccionario de idiomas para que solo contenga el seleccionado
-            audio_languages = {selected_audio: audio_languages.get(selected_audio, '')}
-        else:
-            # Si no se detectó ningún audio, usar el stream 0 (por si acaso)
-            audio_indices = [0]
-            audio_languages = {0: ''}
-
-        # 5. Para archivos grandes (>5 GB) o UHD, omitir subtítulos para ahorrar memoria
         file_size = file_path.stat().st_size
-        if file_size > 5 * 1024**3 or self._is_uhd_resolution(resolution):
-            sub_indices = []   # no mapear subtítulos
+        res = resolution or {}
+        plan = planificar_pistas(
+            audio_languages,
+            audio_indices,
+            sub_indices,
+            es_anime(file_path),
+            omitir_subtitulos(file_size, res.get("width", 0), res.get("height", 0)),
+            titulos_audio=self.titulos_audio(file_path),
+        )
+        audio_indices = plan.audio
+        audio_languages = plan.idiomas_audio
+        sub_indices = plan.subtitulos_espanol
+        if plan.omitir_subtitulos:
             self.logger.info(f"Archivo grande/UHD: omitiendo subtítulos para ahorrar memoria")
-        # (Opcional: si se quiere limitar subtítulos a solo el primero en español, se puede descomentar)
-        # else:
-        #     if sub_indices:
-        #         # Podríamos filtrar subtítulos para quedarnos solo con el primero, pero lo dejamos como estaba.
-        #         pass
 
         # Temporal
         temp_output = file_path.with_suffix(COMPRESSED_FILE_SUFFIX)
@@ -2451,7 +2467,13 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
 
         return (
             True,
-            {"use_gpu": use_gpu, "has_spanish": has_spanish, "use_remux": use_remux},
+            {
+                "use_gpu": use_gpu,
+                "has_spanish": has_spanish,
+                "use_remux": use_remux,
+                "omitir_subtitulos": plan.omitir_subtitulos,
+                "nombres_audio": plan.nombres_audio,
+            },
             temp_output,
             audio_indices,
             sub_indices,
@@ -2469,6 +2491,8 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
         audio_languages: Optional[Dict[int, str]] = None,
         skip_subtitles: bool = False,
         resolution: Optional[Dict[str, Any]] = None,
+        omitir_subtitulos: bool = False,
+        nombres_audio: Optional[Dict[int, str]] = None,
     ) -> Tuple[subprocess.CompletedProcess, float]:
         """
         Ejecuta un intento de compresión o remux usando ffmpeg.
@@ -2484,6 +2508,10 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
             resolution: Resolución/pix_fmt/transferencia ya detectados (evita
                 reprobar); decide la conversión a 8-bit en GPU y, en 4K/UHD,
                 el reescalado a 1080p con tonemapping.
+            omitir_subtitulos: el plan omite los subtítulos incrustados
+                (archivo grande o UHD); no se mapea ninguno.
+            nombres_audio: nombre de cada pista de audio {index: nombre}
+                (variante regional o título original; ver _nombre_audio_args).
 
         Returns:
             Tuple conteniendo:
@@ -2500,38 +2528,52 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
 
         if skip_subtitles:
             ffmpeg_cmd = self._build_ffmpeg_command_no_subtitles(
-                file_path, temp_output, audio_indices, audio_languages, threads=threads, resolution=resolution
+                file_path, temp_output, audio_indices, audio_languages, threads=threads, resolution=resolution,
+                nombres_audio=nombres_audio,
             )
             cmd_str = " ".join(ffmpeg_cmd[:10]) + " ... [CPU/audio/no-subs]"
             self.logger.info(f"Comando ffmpeg NO-SUBS: {cmd_str}")
         elif use_remux:
             # Usar remux para archivos AV1 (sin recodificación)
-            ffmpeg_cmd = self._build_remux_command(file_path, temp_output, audio_indices, sub_indices, audio_languages)
+            ffmpeg_cmd = self._build_remux_command(
+                file_path, temp_output, audio_indices, sub_indices, audio_languages,
+                omitir_subtitulos=omitir_subtitulos, nombres_audio=nombres_audio,
+            )
             cmd_str = " ".join(ffmpeg_cmd[:8]) + " ... [REMUX/copy/output]"
             self.logger.info(f"Comando ffmpeg REMUX: {cmd_str}")
         elif use_gpu:
             ffmpeg_cmd = self._build_ffmpeg_command(
-                file_path, temp_output, audio_indices, sub_indices, audio_languages, resolution=resolution, threads=threads
+                file_path, temp_output, audio_indices, sub_indices, audio_languages, resolution=resolution, threads=threads,
+                omitir_subtitulos=omitir_subtitulos, nombres_audio=nombres_audio,
             )
             cmd_str = " ".join(ffmpeg_cmd[:12]) + " ... [GPU/audio/subs/output]"
             self.logger.info(f"Comando ffmpeg GPU: {cmd_str}")
         else:
             ffmpeg_cmd = self._build_fallback_ffmpeg_command(
                 file_path, temp_output, audio_indices, sub_indices, audio_languages, threads=threads,
-                resolution=resolution,
+                resolution=resolution, omitir_subtitulos=omitir_subtitulos, nombres_audio=nombres_audio,
             )
             cmd_str = " ".join(ffmpeg_cmd[:8]) + " ... [CPU/audio/output]"
             self.logger.info(f"Comando ffmpeg CPU: {cmd_str}")
 
-        start_time = time.time()
-        process = subprocess.run(
-            ffmpeg_cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,  # Capturar stderr para obtener errores de FFmpeg
-            text=True,
-            timeout=FFMPEG_TIMEOUT,
-        )
-        elapsed_time = time.time() - start_time
+        # Avance para el panel: accesorio, nunca debe impedir ni alterar la compresión
+        if use_remux:
+            metodo = "Remux"
+        elif use_gpu:
+            metodo = "GPU (VAAPI)"
+        else:
+            metodo = "CPU (libx264)"
+        # Una etapa por worker: con varios en paralelo ninguno pisa el avance de otro
+        etapa = f"compresion-{os.getpid()}"
+        usar_progreso = self._progreso_disponible()
+        duracion = self._duracion_para_progreso(file_path) if usar_progreso else None
+        progreso.iniciar(etapa, file_path.name, duracion, metodo)
+        try:
+            start_time = time.time()
+            process = self._run_ffmpeg_con_progreso(ffmpeg_cmd, etapa, usar_progreso)
+            elapsed_time = time.time() - start_time
+        finally:
+            progreso.terminar(etapa)
 
         # Si el intento falló, subir el snippet de stderr a WARNING (no debug) para que
         # quede visible en el log normal y se pueda diagnosticar sin activar debug logging.
@@ -2551,6 +2593,86 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
 
         return process, elapsed_time
 
+    @staticmethod
+    def _progreso_disponible() -> bool:
+        """True si la carpeta de progreso existe (o se pudo crear) y admite escritura."""
+        try:
+            dir_progreso = Path(progreso.DIR_PROGRESO)
+            dir_progreso.mkdir(parents=True, exist_ok=True)
+            return dir_progreso.is_dir() and os.access(dir_progreso, os.W_OK)
+        except Exception:
+            return False
+
+    def _duracion_para_progreso(self, file_path: Path) -> Optional[float]:
+        """
+        Duración del archivo (ffprobe format=duration) para el avance; None si no se pudo.
+
+        Se calcula una sola vez por archivo: los reintentos (GPU → CPU → sin
+        subtítulos) reutilizan el valor en vez de volver a sondear.
+        """
+        clave = str(file_path)
+        cache = getattr(self, "_duracion_progreso_cache", None)
+        if cache is not None and cache[0] == clave:
+            return cache[1]
+        duracion = self._sondear_duracion(file_path)
+        self._duracion_progreso_cache = (clave, duracion)
+        return duracion
+
+    @staticmethod
+    def _sondear_duracion(file_path: Path) -> Optional[float]:
+        try:
+            probe = subprocess.run(
+                [
+                    "ffprobe",
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "format=duration",
+                    "-of",
+                    "default=noprint_wrappers=1:nokey=1",
+                    str(file_path),
+                ],
+                capture_output=True,
+                timeout=30,
+                encoding="utf-8",
+                errors="replace",
+            )
+            duracion = float(probe.stdout.strip()) if probe.returncode == 0 else None
+        except Exception:
+            return None
+        if duracion is None or not duracion > 0 or duracion == float("inf"):
+            return None
+        return duracion
+
+    def _run_ffmpeg_con_progreso(
+        self, ffmpeg_cmd: List[str], etapa: str, usar_progreso: bool
+    ) -> subprocess.CompletedProcess:
+        """
+        Ejecuta ffmpeg escribiendo su avance en la carpeta de progreso.
+
+        Las opciones -progress van justo antes de la salida (el último argumento).
+        ffmpeg aborta si no puede abrir esa ruta, así que solo se agregan si la
+        carpeta se puede usar (usar_progreso), y si aun así la rechaza se repite
+        el comando original sin ellas.
+        """
+        def correr(cmd: List[str]) -> subprocess.CompletedProcess:
+            return subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,  # Capturar stderr para obtener errores de FFmpeg
+                text=True,
+                timeout=FFMPEG_TIMEOUT,
+            )
+
+        if not usar_progreso or not ffmpeg_cmd:
+            return correr(ffmpeg_cmd)
+
+        process = correr(ffmpeg_cmd[:-1] + progreso.ffmpeg_args(etapa) + ffmpeg_cmd[-1:])
+        if process.returncode != 0 and "progress URL" in (process.stderr or ""):
+            self.logger.warning("ffmpeg no pudo escribir el avance; se repite sin -progress")
+            process = correr(ffmpeg_cmd)
+        return process
+
     def _handle_fallback_logic(
         self,
         compression_result: Dict,
@@ -2563,6 +2685,8 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
         audio_languages: Optional[Dict[int, str]] = None,
         use_remux: bool = False,
         resolution: Optional[Dict[str, Any]] = None,
+        omitir_subtitulos: bool = False,
+        nombres_audio: Optional[Dict[int, str]] = None,
     ) -> Dict:
         """Maneja la lógica de fallback CPU"""
         if audio_languages is None:
@@ -2578,7 +2702,7 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
                 temp_output.unlink()
             process, new_elapsed_time = self._execute_compression_attempt(
                 file_path, temp_output, False, audio_indices, sub_indices, False, audio_languages,
-                resolution=resolution,
+                resolution=resolution, omitir_subtitulos=omitir_subtitulos, nombres_audio=nombres_audio,
             )
             compression_result = self._process_compression_result(
                 process, file_path, temp_output, new_elapsed_time, False
@@ -2591,7 +2715,7 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
                 temp_output.unlink()
             process, new_elapsed_time = self._execute_compression_attempt(
                 file_path, temp_output, False, audio_indices, sub_indices, False, audio_languages,
-                resolution=resolution,
+                resolution=resolution, omitir_subtitulos=omitir_subtitulos, nombres_audio=nombres_audio,
             )
             compression_result = self._process_compression_result(
                 process, file_path, temp_output, new_elapsed_time, False
@@ -2601,15 +2725,14 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
             if (
                 not compression_result.get("success", False)
                 and process is not None
-                and getattr(process, "stderr", "")
-                and "Could not find codec parameters" in process.stderr
+                and self._es_error_de_subtitulos(getattr(process, "stderr", ""))
             ):
                 self.logger.warning(f"Remux->CPU reencode falló por subtítulos, reintentando sin subtítulos: {file_path.name}")
                 if temp_output.exists():
                     temp_output.unlink()
                 process, new_elapsed_time = self._execute_compression_attempt(
                     file_path, temp_output, False, audio_indices, [], False, audio_languages, skip_subtitles=True,
-                    resolution=resolution,
+                    resolution=resolution, nombres_audio=nombres_audio,
                 )
                 compression_result = self._process_compression_result(
                     process, file_path, temp_output, new_elapsed_time, False
@@ -2619,8 +2742,7 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
         if (
             not compression_result.get("success", False)
             and process is not None
-            and getattr(process, "stderr", "")
-            and "Could not find codec parameters" in process.stderr
+            and self._es_error_de_subtitulos(getattr(process, "stderr", ""))
         ):
             self.logger.warning(f"Error de subtítulos detectado, reintentando sin subtítulos: {file_path.name}")
             if temp_output.exists():
@@ -2635,6 +2757,7 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
                 audio_languages,
                 skip_subtitles=True,
                 resolution=resolution,
+                nombres_audio=nombres_audio,
             )
             compression_result = self._process_compression_result(
                 process, file_path, temp_output, new_elapsed_time, False
