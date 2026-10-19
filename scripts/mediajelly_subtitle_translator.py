@@ -24,7 +24,12 @@ import tempfile
 
 from mediajelly_emoji import EmojiGenerator
 from mediajelly_utils import MediaJellyPaths, create_compressed_rotating_file_handler
-from mediajelly_whisper_extractor import WhisperAudioExtractorMixin, WHISPER_AVAILABLE
+from mediajelly_whisper_extractor import (
+    WhisperAudioExtractorMixin,
+    WHISPER_AVAILABLE,
+    limpiar_nombre_nfo,
+    referencias_nfo,
+)
 from mediajelly_db import (
     get_pending_files,
     get_subtitle_queue,
@@ -112,6 +117,26 @@ TRANSLATE_REQUEST_TIMEOUT = 60
 MAX_TRANSLATE_FAILURES = 5
 
 SPANISH_LANG_CODES = {"spa", "es", "esp", "spanish"}
+
+# Separa las líneas de un bloque en una sola petición a Yandex. " ||| " volvía
+# como "| | |" o "/ / /" y dos líneas de un subtítulo quedaban pegadas; [[S]]
+# llega intacto y deja que Yandex traduzca el bloque con su contexto.
+SEPARADOR_LINEAS = " [[S]] "
+_SEPARADOR_RE = re.compile(r"\s*\[\[\s*S\s*\]\]\s*")
+# Nombres de personajes (del .nfo) protegidos con marcadores que Yandex no traduce
+_MARCADOR_NOMBRE_RE = re.compile(r"\[\[\s*N\s*(\d+)\s*\]\]")
+# Kana, kanji y hangul. En esas líneas no se usan marcadores: Yandex pierde el
+# contexto ("[[N0]]様の気は" -> "Beerus Tu qi"); los nombres se normalizan después.
+_ESCRITURA_CJK_RE = re.compile(r"[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]")
+# Honoríficos japoneses que el traductor pega al nombre ("Gokusan" -> "Goku-san")
+_HONORIFICOS = r"san|sama|kun|chan|dono|senpai|sensei"
+# Partes de un nombre compuesto que son palabras comunes: no se protegen solas
+# ("Son Goku" protege "Goku", pero "Son" o "Elder" sueltos son texto normal).
+_PARTES_COMUNES = {
+    "son", "mr", "mrs", "ms", "dr", "sir", "lord", "lady", "king", "queen", "prince", "princess",
+    "master", "elder", "young", "old", "big", "little", "captain", "general", "doctor", "the",
+    "of", "and", "god", "san", "sama", "kun", "chan", "senpai", "sensei", "great", "grand",
+}
 ENGLISH_LANG_CODES = {"eng", "en", "english"}
 TEXT_SUBTITLE_CODECS = {"subrip", "srt", "ass", "ssa", "webvtt", "mov_text"}
 # Títulos de pistas parciales (no contienen el diálogo completo)
@@ -896,6 +921,16 @@ class SubtitleTranslator(WhisperAudioExtractorMixin):
                 except Exception:
                     translator = None
 
+            # Nombres de personajes que no se traducen (los mismos que usa el transcriptor);
+            # se protegen solo los que el traductor cambiaría.
+            self._glosario_actual = self._glosario_nombres(srt_file)
+            self._nombres_protegidos = self._nombres_que_cambian(translator, self._glosario_actual)
+            if self._glosario_actual:
+                self.logger.info(
+                    f"Nombres de personajes: {len(self._glosario_actual)} desde .nfo, "
+                    f"{len(self._nombres_protegidos)} protegidos en la traducción"
+                )
+
             # Primera traducción
             with open(srt_file, "r", encoding="utf-8", errors="ignore") as f:
                 original_lines = f.readlines()
@@ -925,6 +960,100 @@ class SubtitleTranslator(WhisperAudioExtractorMixin):
         except ImportError as e:
             self.logger.error(f"Faltan dependencias para traducción: {e}")
             return None
+
+    def _glosario_nombres(self, srt_file: Path) -> List[str]:
+        """Nombres de personajes que no se traducen, desde los .nfo del video.
+
+        Los mismos .nfo que usa el transcriptor (el del video, movie.nfo y el
+        tvshow.nfo de la serie). Incluye cada nombre completo y las partes de un
+        nombre compuesto que no son palabras comunes ("Son Goku" -> "Goku"). Del
+        más largo al más corto, para que "Son Goku" gane sobre "Goku".
+        """
+        # "Serie S01E01.en.srt" -> "Serie S01E01.nfo"
+        stem = srt_file.name[:-4] if srt_file.name.lower().endswith(".srt") else srt_file.stem
+        while "." in stem and len(stem.rsplit(".", 1)[1]) <= 3:
+            stem = stem.rsplit(".", 1)[0]
+        roles, _ = referencias_nfo(srt_file.parent / f"{stem}.nfo")
+
+        nombres: Dict[str, str] = {}
+        for raw in roles:
+            nombre = limpiar_nombre_nfo(raw)
+            if len(nombre) < 3:
+                continue
+            nombres.setdefault(nombre.lower(), nombre)
+            partes = nombre.split()
+            if len(partes) > 1:
+                for parte in partes:
+                    parte = parte.strip(".,")
+                    if len(parte) >= 3 and parte.lower() not in _PARTES_COMUNES:
+                        nombres.setdefault(parte.lower(), parte)
+        return sorted(nombres.values(), key=len, reverse=True)
+
+    def _proteger_nombres(self, texto: str) -> str:
+        """Cambia cada nombre del glosario por [[Nk]] (ver _restaurar_nombres).
+
+        Solo cuenta como nombre si no está pegado a otras letras latinas: "Kai"
+        no se toca dentro de "Kaio", pero sí en "Beerus様" (texto japonés).
+        """
+        if _ESCRITURA_CJK_RE.search(texto):
+            return texto
+        protegidos = getattr(self, "_nombres_protegidos", None)
+        for k, nombre in enumerate(getattr(self, "_glosario_actual", None) or []):
+            if protegidos is not None and nombre not in protegidos:
+                continue
+            patron = r"(?<![A-Za-z])" + re.escape(nombre) + r"(?![A-Za-z])"
+            texto = re.sub(patron, f"[[N{k}]]", texto, flags=re.IGNORECASE)
+        return texto
+
+    def _nombres_que_cambian(self, translator, glosario: List[str]) -> set:
+        """Nombres del glosario que el traductor cambiaría ("Mr. Satan" -> "Sr. Satanás").
+
+        Solo esos se protegen con marcadores: un marcador le quita contexto a la
+        frase ("ayudar [[N0]]" pierde la "a" personal), así que no se usa con los
+        nombres que el traductor ya deja como están. Una sola petición por archivo;
+        si falla, se protegen todos.
+        """
+        if not glosario or translator is None:
+            return set(glosario)
+        # Una frase por línea: con frases completas Yandex a veces une las que van
+        # separadas con [[S]], pero respeta los saltos de línea.
+        frases = [f"I saw {nombre} yesterday." for nombre in glosario]
+        try:
+            resultado = self._translate_with_timeout(translator, "\n".join(frases))
+            texto = resultado.result if hasattr(resultado, "result") else str(resultado)
+        except Exception as e:
+            self.logger.debug(f"No se pudo probar el glosario con el traductor: {e}")
+            return set(glosario)
+        partes = texto.strip().split("\n")
+        if len(partes) != len(glosario):
+            return set(glosario)
+        return {n for n, parte in zip(glosario, partes) if n.lower() not in parte.lower()}
+
+    def _normalizar_nombres(self, texto: str) -> str:
+        """Escribe los nombres del glosario como en el .nfo tras traducir.
+
+        Separa el honorífico que el traductor pega al nombre ("Gokusan" ->
+        "Goku-san") y corrige mayúsculas de los nombres compuestos ("son Goku"
+        -> "Son Goku"). Los nombres de una palabra no cambian de mayúsculas: pueden
+        coincidir con palabras comunes.
+        """
+        for nombre in getattr(self, "_glosario_actual", None) or []:
+            base = r"(?<![A-Za-z])" + re.escape(nombre)
+            texto = re.sub(base + r"-?(" + _HONORIFICOS + r")(?![A-Za-z])",
+                           lambda m: f"{nombre}-{m.group(1).lower()}", texto, flags=re.IGNORECASE)
+            if " " in nombre:
+                texto = re.sub(base + r"(?![A-Za-z])", nombre, texto, flags=re.IGNORECASE)
+        return texto
+
+    def _restaurar_nombres(self, texto: str) -> str:
+        """Devuelve cada [[Nk]] a su nombre, tolerando espacios que meta el traductor."""
+        glosario = getattr(self, "_glosario_actual", None) or []
+
+        def nombre(m):
+            k = int(m.group(1))
+            return glosario[k] if k < len(glosario) else m.group(0)
+
+        return _MARCADOR_NOMBRE_RE.sub(nombre, texto)
 
     def _translation_dependencies_available(self) -> bool:
         """
@@ -978,16 +1107,23 @@ class SubtitleTranslator(WhisperAudioExtractorMixin):
                 char_count += len(lines[j])
                 j += 1
 
-            # Traducir el bloque en batch
-            joined = " ||| ".join(block_lines)
+            # Traducir el bloque en una sola petición, con los nombres protegidos
+            protegidas = [self._proteger_nombres(b) for b in block_lines]
+            joined = SEPARADOR_LINEAS.join(protegidas)
             block_translated = True
             try:
                 translated_obj = self._translate_with_timeout(translator, joined)
                 translated_text = translated_obj.result if hasattr(translated_obj, "result") else str(translated_obj)
-                parts = translated_text.split(" ||| ")
+                parts = _SEPARADOR_RE.split(translated_text.strip())
                 if len(parts) != len(block_lines):
-                    # Fallback: split por nueva línea
-                    parts = translated_text.split("\n")
+                    # Yandex unió las líneas: de nuevo con saltos de línea (los respeta,
+                    # aunque traduce cada línea con menos contexto).
+                    parts = self._traducir_linea_suelta(translator, "\n".join(protegidas)).strip().split("\n")
+                if len(parts) != len(block_lines):
+                    # Tampoco: una petición por línea, para no pegar dos líneas del
+                    # subtítulo en una sola.
+                    parts = [self._traducir_linea_suelta(translator, p) for p in protegidas]
+                parts = [self._normalizar_nombres(self._restaurar_nombres(p)) for p in parts]
                 consecutive_failures = 0
             except Exception as e:
                 self.logger.debug(f"Batch translation failed: {e}")
@@ -1008,6 +1144,15 @@ class SubtitleTranslator(WhisperAudioExtractorMixin):
             i = j
 
         return translated_lines, translations_made
+
+    def _traducir_linea_suelta(self, translator, linea: str) -> str:
+        """Traduce una línea sola; si falla, la deja como estaba."""
+        try:
+            resultado = self._translate_with_timeout(translator, linea)
+            return resultado.result if hasattr(resultado, "result") else str(resultado)
+        except Exception as e:
+            self.logger.debug(f"Traducción de línea suelta fallida: {e}")
+            return linea
 
     def _translate_with_timeout(self, translator, text: str):
         """
