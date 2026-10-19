@@ -349,6 +349,59 @@ services:
       - radarr
       - sonarr
 
+  # Panel web de solo lectura (puerto 8765, solo red local). Usa la misma imagen
+  # que mediajelly-cron, pero reemplaza el ENTRYPOINT para no arrancar otra vez
+  # cron ni el bot.
+  mediajelly-panel:
+    build:
+      context: .
+      dockerfile: Dockerfile.hybrid
+      args:
+        PUID: ${PUID:-1000}
+        PGID: ${PGID:-1000}
+        TZ: ${TZ:-UTC}
+    container_name: mediajelly-panel
+    user: "${PUID:-1000}:${PGID:-1000}"
+    working_dir: /mediajelly/scripts
+    entrypoint:
+      [
+        "python3",
+        "-m",
+        "uvicorn",
+        "panel.app:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8765",
+      ]
+    environment:
+      - TZ=${TZ:-UTC}
+      - PYTHONUNBUFFERED=1
+      # Obligatoria: sin ella el panel responde 503
+      - PANEL_PASSWORD=${PANEL_PASSWORD:-}
+      # Opcional: si falta, las sesiones se pierden al reiniciar
+      - PANEL_SECRET=${PANEL_SECRET:-}
+    networks:
+      - mynetwork
+    volumes:
+      # El código va en solo lectura; tmp en escritura porque SQLite crea el -shm
+      # de la BD (aun leyendo) y ahí están el progreso y los logs
+      - ./scripts:/mediajelly/scripts:ro
+      - ./scripts/tmp:/mediajelly/scripts/tmp:rw
+      # Solo mide el disco: la biblioteca va en solo lectura
+      - ./data/media:/mediajelly/media:ro
+    ports:
+      - "8765:8765"
+    restart: unless-stopped
+    logging: *default-logging
+    mem_limit: 512m
+    cpus: "1.0"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://localhost:8765/login"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
   redis:
     image: redis:7-alpine
     container_name: mediajelly-redis

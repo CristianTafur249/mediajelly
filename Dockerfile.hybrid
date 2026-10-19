@@ -42,9 +42,6 @@ RUN groupadd -g ${PGID} mediauser || groupadd mediauser && \
 RUN mkdir -p /mediajelly/scripts /mediajelly/config /mediajelly/media && \
     chown -R ${PUID}:${PGID} /mediajelly
 
-# Copiar requirements y scripts
-COPY requirements.txt /tmp/requirements.txt
-
 # Instalar dependencias de Python
 RUN pip3 install --no-cache-dir --default-timeout=100 \
     "requests>=2.31.0" \
@@ -65,7 +62,23 @@ RUN pip3 install --no-cache-dir --default-timeout=1000 --retries 10 \
     "openai-whisper>=20231117" \
     "faster-whisper>=1.0.0"
 
+# Panel web: capa propia DESPUÉS de Whisper/torch para no invalidar su caché.
+# Versiones fijas compatibles con el Python 3.10 de Ubuntu 22.04: starlette 1.8+ y
+# websockets 17+ exigen 3.11. Mantener iguales a requirements.txt.
+RUN pip3 install --no-cache-dir --default-timeout=100 \
+    "fastapi==0.146.0" \
+    "starlette==1.7.0" \
+    "uvicorn[standard]==0.54.0" \
+    "websockets==16.1.1" \
+    "itsdangerous==2.2.0" \
+    "python-multipart==0.0.32" \
+    "jinja2==3.1.6"
+
 RUN pip3 cache purge
+
+# Solo como referencia (nada lo instala desde aquí). Va DESPUÉS de las capas de pip:
+# antes invalidaba la caché de torch/Whisper (~3 GB) cada vez que cambiaba requirements.txt.
+COPY requirements.txt /tmp/requirements.txt
 
 # Entrypoint y crontabs van DESPUÉS de las dependencias: así un cambio en ellos no
 # invalida las capas de pip (≈3 GB de descargas).

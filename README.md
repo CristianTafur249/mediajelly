@@ -293,6 +293,39 @@ curl http://localhost:8000/queue
 curl http://localhost:8000/stats
 ```
 
+## 🖥️ Panel web
+
+Panel para ver y controlar MediaJelly desde el celular o el PC. Muestra:
+
+- **Inicio**: fase del ciclo, progreso en vivo de cada compresión y transcripción, contadores por estado, espacio ahorrado, alertas (cuarentena, disco casi lleno, ciclo atrasado), las últimas tareas del panel y el botón **Ejecutar ciclo ahora**.
+- **Cola**: archivos pendientes, en proceso y en cuarentena, con intentos y último error. Por fila o en lote: **reprocesar**, **procesar primero**, **sacar de cuarentena** y **omitir**. Un archivo que se está comprimiendo no se toca.
+- **Detalle de video** (al tocar un archivo de la Cola): códec, resolución, bitrate y tamaño; cada pista de audio y subtítulo con su etiqueta, el idioma detectado y qué hará el procesador con ella (✔ se conserva, ✂ se quita). Acciones: reprocesar, **detectar idioma** con Whisper y **corregir el idioma** de una pista.
+- **Registros**: el final de los logs de cron, compresión, errores, idiomas y subtítulos, con filtro y lo más reciente arriba.
+
+Cómo activarlo:
+
+1. Agrega `PANEL_PASSWORD` al `.env` (hay un ejemplo en `.env.example`).
+2. `docker compose build mediajelly-panel`
+3. `docker compose up -d mediajelly-panel`
+
+Luego abre `http://<ip-del-servidor>:8765`. El puerto es **8765**.
+
+> **Solo para la red local.** El panel usa HTTP sin cifrar y una sola contraseña: no lo expongas a internet ni abras el puerto en el router.
+
+Las acciones rápidas (reprocesar, prioridad, omitir) solo cambian el estado en la base de datos. Las pesadas (ejecutar ciclo, detectar y corregir idioma) quedan como tareas en la tabla `panel_tareas`, y `mediajelly_tareas.py` las ejecuta cada minuto desde el contenedor `mediajelly-cron`, de a una y sin cruzarse con un ciclo en curso (usa el mismo candado). Su log está en `scripts/tmp/logs/tareas.log`.
+
+> **Requiere reconstruir el cron.** La línea de `mediajelly_tareas.py` va en `config/crontab-python`, que se copia a la imagen al construirla: después de agregarla, `docker compose build mediajelly-cron mediajelly-panel` y `docker compose up -d`.
+
+La línea exacta del crontab es:
+
+```
+* * * * * mediauser cd /mediajelly/scripts && python3 mediajelly_tareas.py >> /mediajelly/scripts/tmp/logs/tareas.log 2>&1
+```
+
+Si no hay tareas pendientes, no escribe nada en el log. Mientras corre una tarea pesada (detectar o corregir idioma) tiene tomado el mismo candado que el ciclo, así que el ciclo programado que coincida con ella se salta y corre en la próxima hora.
+
+`PANEL_SECRET` es opcional y firma las sesiones. Si no la defines, se genera una al azar y tendrás que iniciar sesión de nuevo cada vez que se reinicie el contenedor. Sin `PANEL_PASSWORD` el panel responde 503.
+
 ## 🔧 Troubleshooting
 
 ### Problemas comunes y soluciones
