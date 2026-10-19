@@ -15,11 +15,13 @@ MediaJellyProcessor.__init__): `self.logger`, `self.whisper_enabled`,
 estos métodos.
 """
 
+import json
 import subprocess
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from mediajelly_emoji import EmojiGenerator
+from mediajelly_politica import es_espanol, idioma_por_metadatos
 
 SHORT_TIMEOUT = 10
 try:
@@ -373,13 +375,15 @@ class LanguageDetectionMixin:
             # (language_cache.json ya no se consulta: va por ruta y puede traer el
             # idioma de otro archivo que estuvo en la misma ruta)
 
-            # Paso 1: Intentar detección por metadatos (solo si hay metadatos claros)
+            # Paso 1: Intentar detección por metadatos (solo si hay metadatos claros).
+            # stream_index es el índice absoluto: se selecciona con "N", no con
+            # "a:N" (ese es el N-ésimo audio, otra pista o ninguna).
             cmd = [
                 "ffprobe",
                 "-v",
                 "error",
                 "-select_streams",
-                f"a:{stream_index}",
+                str(stream_index),
                 "-show_entries",
                 "stream=codec_name:stream_tags=title,handler_name",
                 "-of",
@@ -390,33 +394,14 @@ class LanguageDetectionMixin:
             result = subprocess.run(cmd, capture_output=True, timeout=SHORT_TIMEOUT, encoding="utf-8", errors="replace")
 
             if result.returncode == 0 and result.stdout.strip():
-                metadata = result.stdout.strip().lower()
-
-                # Buscar patrones en metadatos que indiquen idioma
-                spanish_patterns = ["spanish", "español", "castellano", "spa", "esp", "latino", "lat"]
-                english_patterns = ["english", "inglés", "eng"]
-                japanese_patterns = ["japanese", "japonés", "jpn", "jap"]
-
-                for pattern in spanish_patterns:
-                    if pattern in metadata:
-                        self.logger.info(
-                            f"{EmojiGenerator.clipboard()} Idioma detectado por metadatos (español) en stream {stream_index}: {file_path.name}"
-                        )
-                        return "spa"
-
-                for pattern in english_patterns:
-                    if pattern in metadata:
-                        self.logger.info(
-                            f"{EmojiGenerator.clipboard()} Idioma detectado por metadatos (inglés) en stream {stream_index}: {file_path.name}"
-                        )
-                        return "eng"
-
-                for pattern in japanese_patterns:
-                    if pattern in metadata:
-                        self.logger.info(
-                            f"{EmojiGenerator.clipboard()} Idioma detectado por metadatos (japonés) en stream {stream_index}: {file_path.name}"
-                        )
-                        return "jpn"
+                # Palabras completas (mediajelly_politica): "rest" o "best" no son español
+                nombres = {"spa": "español", "eng": "inglés", "jpn": "japonés"}
+                lang_meta = idioma_por_metadatos(result.stdout)
+                if lang_meta:
+                    self.logger.info(
+                        f"{EmojiGenerator.clipboard()} Idioma detectado por metadatos ({nombres[lang_meta]}) en stream {stream_index}: {file_path.name}"
+                    )
+                    return lang_meta
 
             # Paso 2: Intentar detección con Whisper si está disponible
             if not allow_whisper_fallback:
@@ -449,6 +434,34 @@ class LanguageDetectionMixin:
         except Exception as e:
             self.logger.error(f"Error detectando idioma de audio en stream {stream_index} de {file_path}: {e}")
             return None  # No asumir idioma en caso de error
+
+    def titulos_audio(self, file_path: Path) -> Dict[int, str]:
+        """Título de cada pista de audio {índice relativo: título} (o su handler_name).
+
+        Sirve para conservar la variante regional ("Latino", "Castellano") que el
+        MP4 descartaría: ver mediajelly_politica.nombre_pista. Un fallo de
+        ffprobe da {} (las pistas quedan sin nombre, como antes).
+        """
+        try:
+            result = subprocess.run(
+                [
+                    "ffprobe", "-v", "error", "-select_streams", "a",
+                    "-show_entries", "stream=index:stream_tags=title,handler_name",
+                    "-of", "json", str(file_path),
+                ],
+                capture_output=True, timeout=SHORT_TIMEOUT, encoding="utf-8", errors="replace",
+            )
+            pistas = json.loads(result.stdout or "{}").get("streams", [])
+        except Exception as e:
+            self.logger.debug(f"No se pudieron leer los títulos de audio de {file_path.name}: {e}")
+            return {}
+        titulos = {}
+        for relativo, pista in enumerate(pistas):
+            etiquetas = {k.lower(): v for k, v in (pista.get("tags") or {}).items()}
+            titulo = (etiquetas.get("title") or etiquetas.get("handler_name") or "").strip()
+            if titulo:
+                titulos[relativo] = titulo
+        return titulos
 
     def detect_language_streams(
         self, file_path: Path, allow_whisper_fallback: bool = True
@@ -534,8 +547,9 @@ class LanguageDetectionMixin:
                                 lang = "und"
                             audio_languages[audio_stream_counter] = lang
 
-                            # Verificar si es español
-                            if any(pattern in lang for pattern in ["spa", "esp", "es", "lat"]):
+                            # Verificar si es español (código exacto o palabra completa:
+                            # "ces" o "est" no cuentan)
+                            if es_espanol(lang):
                                 audio_indices.append(audio_stream_counter)
 
                             audio_stream_counter += 1
@@ -543,7 +557,7 @@ class LanguageDetectionMixin:
                         elif codec_type == "subtitle":
                             # Usar un contador relativo para subtítulos (0:s:N espera índices relativos)
                             current_sub_index = subtitle_stream_counter
-                            if any(pattern in lang for pattern in ["spa", "esp", "es", "lat"]):
+                            if es_espanol(lang):
                                 sub_indices.append(current_sub_index)
                             # Incrementar contador relativo de subtítulos siempre
                             subtitle_stream_counter += 1
