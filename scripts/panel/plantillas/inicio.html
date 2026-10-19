@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+{% block contenido %}
+<div class="ciclo-ahora">
+  <button type="button" class="boton primario" hx-post="/ciclo" hx-target="#mensaje-ciclo" hx-swap="innerHTML">Ejecutar ciclo ahora</button>
+  <span id="mensaje-ciclo" class="suave" aria-live="polite"></span>
+</div>
+<div class="inicio" hx-ext="sse" sse-connect="/eventos" sse-swap="estado">
+  {% include "_estado.html" %}
+</div>
+{% endblock %}

@@ -1,0 +1,86 @@
+{% set c = estado.contadores %}
+{% if estado.error_bd %}
+<p class="aviso">{{ estado.error_bd }} Se muestran los datos disponibles.</p>
+{% endif %}
+
+{% if estado.alertas %}
+<section class="tarjeta alertas">
+  {% for a in estado.alertas %}<p class="alerta">&#9888; {{ a }}</p>{% endfor %}
+</section>
+{% endif %}
+
+<section class="tarjeta">
+  <h2>{{ estado.ciclo | nombre_fase }}</h2>
+  {% if estado.general.total and estado.general.estado == "processing" %}
+  <p class="suave">Archivo {{ estado.general.actual }} de {{ estado.general.total }}{% if estado.general.nombre %} · {{ estado.general.nombre }}{% endif %}</p>
+  {% endif %}
+</section>
+
+<section class="tarjeta">
+  <h2>En proceso</h2>
+  {% for a in estado.etapas %}
+  <div class="etapa">
+    <div class="etapa-nombre">{{ a.etapa | nombre_etapa }}{% if a.sin_senal %} <span class="sin-senal">sin señal</span>{% endif %}</div>
+    <div class="etapa-archivo">{{ a.archivo }}</div>
+    {% if a.detalle %}<div class="suave">{{ a.detalle }}</div>{% endif %}
+    {% if a.porcentaje is not none %}
+    <progress max="100" value="{{ a.porcentaje | round(1) }}"></progress>
+    <div class="etapa-datos">
+      <strong>{{ a.porcentaje | round | int }} %</strong>
+      <span>{{ a.posicion_s | tiempo }} / {{ a.duracion_s | tiempo }}</span>
+      {% if a.velocidad %}<span>{{ "%.1f" | format(a.velocidad) }}×</span>{% endif %}
+      {% if a.restante_s is not none %}<span>quedan ~{{ a.restante_s | minutos }} min</span>{% endif %}
+    </div>
+    {% endif %}
+  </div>
+  {% else %}
+  <p class="suave">Nada en proceso.</p>
+  {% endfor %}
+</section>
+
+<section class="tarjeta">
+  <h2>Archivos</h2>
+  {% if c %}
+  <dl class="contadores">
+    <div><dd>{{ c.pending }}</dd><dt>Pendientes</dt></div>
+    <div><dd>{{ c.processing }}</dd><dt>Procesando</dt></div>
+    <div><dd>{{ c.done }}</dd><dt>Listos</dt></div>
+    <div><dd>{{ c.skipped }}</dd><dt>Omitidos</dt></div>
+    <div><dd>{{ c.failed }}</dd><dt>Cuarentena</dt></div>
+    <div><dd>{{ c.missing }}</dd><dt>Faltantes</dt></div>
+  </dl>
+  {% else %}
+  <p class="suave">Sin datos.</p>
+  {% endif %}
+</section>
+
+<section class="tarjeta">
+  <h2>Próximos en cola</h2>
+  {% if estado.proximos %}
+  <ol class="proximos">{% for n in estado.proximos %}<li>{{ n }}</li>{% endfor %}</ol>
+  {% else %}
+  <p class="suave">La cola está vacía.</p>
+  {% endif %}
+</section>
+
+<section class="tarjeta">
+  <h2>Espacio ahorrado</h2>
+  <p class="ahorro">{{ estado.ahorro_bytes | tamano }}</p>
+</section>
+
+<section class="tarjeta">
+  <h2>Tareas</h2>
+  {% if tareas %}
+  <ul class="tareas">
+    {% for t in tareas %}
+    <li>
+      <strong>{{ t.tipo }}</strong> <span class="insignia estado-{{ t.estado }}">{{ t.estado }}</span>
+      {% if t.creada %}<span class="suave">{{ t.creada }}</span>{% endif %}
+      {% if t.salida %}<div class="suave tarea-salida">{{ t.salida[:120] }}{% if t.salida|length > 120 %}…{% endif %}</div>{% endif %}
+    </li>
+    {% endfor %}
+  </ul>
+  {% else %}
+  <p class="suave">Sin tareas todavía.</p>
+  {% endif %}
+</section>
