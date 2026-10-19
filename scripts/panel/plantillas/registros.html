@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+{% block contenido %}
+<form class="filtros" method="get" action="/registros">
+  <select name="archivo" aria-label="Registro">
+    {% for clave in registros %}<option value="{{ clave }}" {% if clave == archivo %}selected{% endif %}>{{ etiquetas.get(clave, clave|capitalize) }}</option>{% endfor %}
+  </select>
+  <input type="search" name="filtro" value="{{ filtro }}" placeholder="Filtrar" aria-label="Filtro">
+  <button type="submit">Ver</button>
+</form>
+{% include "_registro_lineas.html" %}
+{% endblock %}

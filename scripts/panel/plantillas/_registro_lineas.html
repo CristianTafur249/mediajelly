@@ -1,0 +1,5 @@
+<div id="lineas" hx-get="/registros" hx-trigger="every 5s" hx-swap="outerHTML"
+     hx-vals='{"archivo": {{ archivo|tojson|forceescape }}, "filtro": {{ filtro|tojson|forceescape }}}'>
+{# lo más nuevo primero: el refresco cada 5 s devuelve el scroll arriba #}
+{% if lineas %}<pre class="registro">{{ lineas|reverse|join("\n") }}</pre>{% else %}<p class="suave">Todavía no hay registros.</p>{% endif %}
+</div>
