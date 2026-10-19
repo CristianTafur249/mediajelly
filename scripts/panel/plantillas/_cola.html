@@ -1,0 +1,53 @@
+{% macro tarjetas(items, vacio, estado, botones) %}
+{% if items %}
+<ul class="lista-cola">
+  {% for a in items %}
+  <li class="tarjeta archivo">
+    <div class="archivo-cabecera">
+      {% if botones %}<input type="checkbox" class="sel" name="fp" value="{{ a.fingerprint }}" form="lote" aria-label="Elegir {{ a.nombre }}">{% endif %}
+      <a class="archivo-nombre" href="/video/{{ a.fingerprint }}" title="{{ a.ruta }}">{{ a.nombre }}</a>
+      {% if a.prioridad and a.prioridad > 0 %}<span class="insignia primero">Primero</span>{% endif %}
+      <span class="insignia">{{ estado }}</span>
+    </div>
+    <div class="archivo-datos suave">
+      <span>Intentos: {{ a.intentos }}</span>
+      {% if a.actualizado %}<span>{{ a.actualizado }}</span>{% endif %}
+    </div>
+    {% if botones %}
+    <div class="acciones-fila" hx-target="#cola-contenido" hx-swap="outerHTML">
+      {% for b in botones %}
+      <button type="button" class="boton" hx-post="/acciones/{{ b[0] }}" hx-vals='{{ {"fp": a.fingerprint}|tojson }}'{% if b[2] %} hx-confirm="{{ b[2] }}"{% endif %}>{{ b[1] }}</button>
+      {% endfor %}
+    </div>
+    {% endif %}
+    {% if a.error %}
+    <details class="archivo-error">
+      <summary>{{ a.error.splitlines()[0] if a.error.splitlines() else a.error }}</summary>
+      <pre>{{ a.error }}</pre>
+      <p class="suave">{{ a.ruta }}</p>
+    </details>
+    {% endif %}
+  </li>
+  {% endfor %}
+</ul>
+{% else %}
+<p class="suave">{{ vacio }}</p>
+{% endif %}
+{% endmacro %}
+<div id="cola-contenido" class="cola">
+  <div id="aviso-cola" class="avisos" role="status" aria-live="polite">{% if aviso %}<p class="aviso">{{ aviso }}</p>{% endif %}</div>
+  <form id="lote" class="lote tarjeta" hx-target="#cola-contenido" hx-swap="outerHTML">
+    <span class="suave">Con los seleccionados:</span>
+    <button type="button" class="boton" hx-post="/acciones/reprocesar" hx-confirm="¿Reprocesar los archivos seleccionados?">Reprocesar</button>
+    <button type="button" class="boton" hx-post="/acciones/procesar-primero" hx-confirm="¿Procesar primero los archivos seleccionados?">Procesar primero</button>
+    <button type="button" class="boton" hx-post="/acciones/sacar-de-cuarentena" hx-confirm="¿Sacar de cuarentena los archivos seleccionados?">Sacar de cuarentena</button>
+    <button type="button" class="boton peligro" hx-post="/acciones/omitir" hx-confirm="¿Omitir los archivos seleccionados? No se procesarán.">Omitir</button>
+  </form>
+  {% if cola.error_bd %}<p class="aviso">{{ cola.error_bd }}</p>{% endif %}
+  <h2>En proceso <span class="suave">({{ cola.en_proceso|length }})</span></h2>
+  {{ tarjetas(cola.en_proceso, "Nada en proceso.", "En proceso", none) }}
+  <h2>Pendientes <span class="suave">({{ cola.pendientes|length }})</span></h2>
+  {{ tarjetas(cola.pendientes, "No hay archivos pendientes.", "Pendiente", [("procesar-primero", "Procesar primero", none), ("omitir", "Omitir", "¿Omitir este archivo? No se procesará.")]) }}
+  <h2>En cuarentena <span class="suave">({{ cola.cuarentena|length }})</span></h2>
+  {{ tarjetas(cola.cuarentena, "Nada en cuarentena.", "Cuarentena", [("sacar-de-cuarentena", "Sacar de cuarentena", none), ("procesar-primero", "Procesar primero", none), ("omitir", "Omitir", "¿Omitir este archivo? No se procesará.")]) }}
+</div>
