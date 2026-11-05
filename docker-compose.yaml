@@ -30,6 +30,8 @@ services:
     mem_limit: 384m
     mem_reservation: 192m
     cpus: "0.75"
+    # Prioridad baja: si el escritorio pide CPU, gana; si está libre, se usa toda.
+    cpu_shares: 256
     healthcheck:
       # El pgrep de la imagen de LinuxServer no reconoce el nombre completo del proceso
       test: ["CMD-SHELL", "nc -z localhost 9091 || exit 1"]
@@ -64,6 +66,7 @@ services:
     mem_limit: 256m
     mem_reservation: 128m
     cpus: "0.5"
+    cpu_shares: 256
 
   radarr:
     container_name: radarr
@@ -87,6 +90,7 @@ services:
     mem_limit: 640m
     mem_reservation: 320m
     cpus: "1.0"
+    cpu_shares: 256
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:7878/ping"]
       interval: 30s
@@ -113,6 +117,7 @@ services:
     mem_limit: 640m
     mem_reservation: 320m
     cpus: "1.0"
+    cpu_shares: 256
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8989/ping"]
       interval: 30s
@@ -139,6 +144,7 @@ services:
     mem_limit: 384m
     mem_reservation: 192m
     cpus: "0.75"
+    cpu_shares: 256
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9696/ping"]
       interval: 30s
@@ -169,6 +175,7 @@ services:
     logging: *default-logging
     mem_limit: 64m
     cpus: "0.25"
+    cpu_shares: 256
 
   # Resuelve los desafíos de Cloudflare de los indexadores (lo usa Prowlarr)
   flaresolverr:
@@ -186,6 +193,8 @@ services:
     mem_limit: 768m
     mem_reservation: 256m
     cpus: "1.0"
+    cpu_shares: 256
+    oom_score_adj: 500
 
   # Indexadores en español que Prowlarr no trae (DonTorrent, MejorTorrent, Wolfmax4K,
   # DivxTotal). Prowlarr los consume como Torznab genérico en http://jackett:9117
@@ -203,12 +212,12 @@ services:
       - AUTO_UPDATE=false
     volumes:
       - ./config/jackett-config:/config:rw
-    # Sin puerto publicado: no tiene contraseña y solo lo usa Prowlarr por la red interna
     restart: unless-stopped
     logging: *default-logging
     mem_limit: 384m
     mem_reservation: 128m
     cpus: "0.75"
+    cpu_shares: 256
     depends_on:
       - flaresolverr
       - dns-doh
@@ -232,6 +241,7 @@ services:
     mem_limit: 384m
     mem_reservation: 192m
     cpus: "0.75"
+    cpu_shares: 256
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:6767/ping"]
       interval: 30s
@@ -262,8 +272,10 @@ services:
     restart: unless-stopped
     logging: *default-logging
     mem_limit: 4g
-    mem_reservation: 2g
+    mem_reservation: 512m
     cpus: "3.0"
+    cpu_shares: 256
+    oom_score_adj: 500
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8096/health"]
       interval: 30s
@@ -292,6 +304,7 @@ services:
     mem_limit: 512m
     mem_reservation: 128m
     cpus: "0.5"
+    cpu_shares: 256
     healthcheck:
       test:
         [
@@ -342,8 +355,10 @@ services:
     restart: unless-stopped
     logging: *default-logging
     mem_limit: 4g
-    mem_reservation: 2g
+    mem_reservation: 512m
     cpus: "5.0"
+    cpu_shares: 256
+    oom_score_adj: 500
     depends_on:
       - transmission
       - radarr
@@ -396,8 +411,17 @@ services:
     logging: *default-logging
     mem_limit: 512m
     cpus: "1.0"
+    cpu_shares: 256
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://localhost:8765/login"]
+      test:
+        [
+          "CMD",
+          "curl",
+          "-fsS",
+          "-o",
+          "/dev/null",
+          "http://localhost:8765/login",
+        ]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -414,6 +438,7 @@ services:
     mem_limit: 256m
     mem_reservation: 128m
     cpus: "0.5"
+    cpu_shares: 256
     command: redis-server --appendonly yes --maxmemory 128mb --maxmemory-policy allkeys-lru --requirepass ${REDIS_PASSWORD}
 
   telegram-transmission-bot:
@@ -436,6 +461,7 @@ services:
     mem_limit: 256m
     mem_reservation: 128m
     cpus: "0.5"
+    cpu_shares: 256
 
 networks:
   mynetwork:
