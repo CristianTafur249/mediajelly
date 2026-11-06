@@ -145,6 +145,98 @@ SDH_SUBTITLE_TITLE_RE = re.compile(r"\bsdh\b|\bcc\b|hearing", re.IGNORECASE)
 SRT_TIMESTAMP_RE = re.compile(
     r"(\d{2}):(\d{2}):(\d{2})[,\.](\d{3})\s*-->\s*(\d{2}):(\d{2}):(\d{2})[,\.](\d{3})"
 )
+# Etiquetas <font> que deja ffmpeg al pasar mov_text a SRT: el Roku no las admite.
+FONT_TAG_RE = re.compile(r"</?font\b[^>]*>", re.IGNORECASE)
+
+
+def _strip_font_tags(text: str) -> str:
+    """Quita las etiquetas <font>; conserva <i>, <b> y <u>, que el Roku sí muestra."""
+    return FONT_TAG_RE.sub("", text)
+
+
+# Tope de caracteres por petición al traductor: Yandex responde 413 por encima.
+MAX_CHARS_PETICION = 3000
+# Etiquetas SRT (<i>, <font ...>) y de ASS ({\an8}, {=10}) que no son texto.
+_ETIQUETAS_RE = re.compile(r"<[^>]*>|\{[^}]*\}")
+_NUM = r"-?\d+(?:\.\d+)?"
+# Dibujo vectorial de ASS ({\p1}): "m 64.78 11.69 l 64.4 6.85 b ...". Al pasar a
+# SRT queda como un cue de miles de caracteres que no es texto.
+_DIBUJO_ASS_RE = re.compile(rf"^m\s+{_NUM}\s+{_NUM}(?:\s+(?:[mnlbspc]|{_NUM}))*$")
+
+
+# Fin de frase, conservando el signo: punto, cierre de pregunta/exclamación, puntos suspensivos y los de CJK.
+_FIN_FRASE_RE = re.compile(r"(?<=[.!?…。！？])\s*")
+
+
+def _dividir_texto(texto: str, maximo: int = MAX_CHARS_PETICION) -> List[str]:
+    """Parte un texto en trozos de hasta `maximo` caracteres para el traductor.
+
+    Corta por final de frase; si una frase sola no cabe, por espacios; y si no
+    tiene espacios (japonés, chino), en seco.
+    """
+    if len(texto) <= maximo:
+        return [texto]
+
+    piezas: List[str] = []
+    for frase in (f for f in _FIN_FRASE_RE.split(texto) if f):
+        if len(frase) <= maximo:
+            piezas.append(frase)
+            continue
+        palabras = frase.split(" ")
+        if len(palabras) == 1:
+            piezas.extend(frase[k:k + maximo] for k in range(0, len(frase), maximo))
+            continue
+        for palabra in palabras:
+            if len(palabra) > maximo:
+                piezas.extend(palabra[k:k + maximo] for k in range(0, len(palabra), maximo))
+            else:
+                piezas.append(palabra)
+
+    # Reagrupar las piezas sin pasar del máximo
+    trozos: List[str] = []
+    actual = ""
+    for pieza in piezas:
+        candidato = f"{actual} {pieza}" if actual else pieza
+        if len(candidato) <= maximo:
+            actual = candidato
+        else:
+            trozos.append(actual)
+            actual = pieza
+    if actual:
+        trozos.append(actual)
+    return trozos
+
+
+def _texto_visible(texto: str) -> str:
+    """Texto de un cue sin etiquetas SRT ni ASS."""
+    return _ETIQUETAS_RE.sub("", texto).strip()
+
+
+def _es_dibujo_ass(texto: str) -> bool:
+    """True si el texto del cue es un dibujo vectorial de ASS y no diálogo."""
+    return bool(_DIBUJO_ASS_RE.match(" ".join(_texto_visible(texto).split())))
+
+
+def _limpiar_srt(contenido: str) -> str:
+    """Quita los cues que son dibujos de ASS y renumera los que quedan.
+
+    Si no hay ninguno, devuelve el contenido sin tocar.
+    """
+    bloques = re.split(r"\n\s*\n", contenido.strip())
+    utiles = []
+    for bloque in bloques:
+        lineas = bloque.splitlines()
+        if len(lineas) >= 3 and "-->" in lineas[1] and _es_dibujo_ass(" ".join(lineas[2:])):
+            continue
+        utiles.append(lineas)
+    if len(utiles) == len(bloques):
+        return contenido
+    salida = []
+    for n, lineas in enumerate(utiles, start=1):
+        if len(lineas) >= 2 and lineas[0].strip().isdigit() and "-->" in lineas[1]:
+            lineas = [str(n)] + lineas[1:]
+        salida.append("\n".join(lineas))
+    return "\n\n".join(salida) + "\n"
 
 
 class SubtitleQualityImprover:
@@ -901,6 +993,9 @@ class SubtitleTranslator(WhisperAudioExtractorMixin):
         Returns:
             Optional[Path]: Ruta del archivo traducido o None.
         """
+        # Los .srt ya extraídos con dibujos de ASS se reparan antes de traducir
+        self._limpiar_srt_en_disco(srt_file)
+
         # Si ya está en español (audio doblado, pista sin etiquetar) no hay nada que
         # traducir: pasarlo por el traductor solo gastaba minutos y peticiones.
         if not force_translate and self.detect_srt_language(srt_file) == "es":
@@ -923,6 +1018,7 @@ class SubtitleTranslator(WhisperAudioExtractorMixin):
 
             # Nombres de personajes que no se traducen (los mismos que usa el transcriptor);
             # se protegen solo los que el traductor cambiaría.
+            self._cache_traduccion: Dict[str, List[str]] = {}
             self._glosario_actual = self._glosario_nombres(srt_file)
             self._nombres_protegidos = self._nombres_que_cambian(translator, self._glosario_actual)
             if self._glosario_actual:
@@ -960,6 +1056,22 @@ class SubtitleTranslator(WhisperAudioExtractorMixin):
         except ImportError as e:
             self.logger.error(f"Faltan dependencias para traducción: {e}")
             return None
+
+    def _limpiar_srt_en_disco(self, srt_file: Path) -> None:
+        """Reescribe el SRT sin los cues que son dibujos de ASS (ver _limpiar_srt)."""
+        try:
+            contenido = srt_file.read_text(encoding="utf-8", errors="replace")
+            limpio = _limpiar_srt(contenido)
+            if limpio == contenido:
+                return
+            tmp = srt_file.with_suffix(srt_file.suffix + ".tmp")
+            tmp.write_text(limpio, encoding="utf-8")
+            tmp.replace(srt_file)
+            self.logger.info(
+                f"Dibujos de ASS quitados de {srt_file.name}: {len(contenido) // 1024} KB -> {len(limpio) // 1024} KB"
+            )
+        except OSError as e:
+            self.logger.warning(f"No se pudo limpiar {srt_file.name}: {e}")
 
     def _glosario_nombres(self, srt_file: Path) -> List[str]:
         """Nombres de personajes que no se traducen, desde los .nfo del video.
@@ -1102,7 +1214,10 @@ class SubtitleTranslator(WhisperAudioExtractorMixin):
             block_lines = []
             j = i
             char_count = 0
-            while j < N and not self._should_skip_translation(lines[j].strip()) and char_count < 3000:
+            while j < N and not self._should_skip_translation(lines[j].strip()):
+                # El tope se mira antes de añadir: la petición nunca pasa de MAX_CHARS_PETICION
+                if block_lines and char_count + len(lines[j]) > MAX_CHARS_PETICION:
+                    break
                 block_lines.append(lines[j].strip())
                 char_count += len(lines[j])
                 j += 1
@@ -1111,19 +1226,19 @@ class SubtitleTranslator(WhisperAudioExtractorMixin):
             protegidas = [self._proteger_nombres(b) for b in block_lines]
             joined = SEPARADOR_LINEAS.join(protegidas)
             block_translated = True
+            # La rotulación de un ASS repite el mismo texto cientos de veces: se pide una vez
+            cache = getattr(self, "_cache_traduccion", None)
             try:
-                translated_obj = self._translate_with_timeout(translator, joined)
-                translated_text = translated_obj.result if hasattr(translated_obj, "result") else str(translated_obj)
-                parts = _SEPARADOR_RE.split(translated_text.strip())
-                if len(parts) != len(block_lines):
-                    # Yandex unió las líneas: de nuevo con saltos de línea (los respeta,
-                    # aunque traduce cada línea con menos contexto).
-                    parts = self._traducir_linea_suelta(translator, "\n".join(protegidas)).strip().split("\n")
-                if len(parts) != len(block_lines):
-                    # Tampoco: una petición por línea, para no pegar dos líneas del
-                    # subtítulo en una sola.
-                    parts = [self._traducir_linea_suelta(translator, p) for p in protegidas]
-                parts = [self._normalizar_nombres(self._restaurar_nombres(p)) for p in parts]
+                if cache is not None and joined in cache:
+                    parts = list(cache[joined])
+                elif len(protegidas) == 1 and len(joined) > MAX_CHARS_PETICION:
+                    # Una sola línea más larga que lo que acepta el servicio: por partes
+                    piezas = [self._traducir_linea_suelta(translator, t) for t in _dividir_texto(joined)]
+                    parts = [self._normalizar_nombres(self._restaurar_nombres(" ".join(piezas)))]
+                else:
+                    parts = self._traducir_bloque(translator, joined, protegidas)
+                if cache is not None:
+                    cache[joined] = list(parts)
                 consecutive_failures = 0
             except Exception as e:
                 self.logger.debug(f"Batch translation failed: {e}")
@@ -1144,6 +1259,21 @@ class SubtitleTranslator(WhisperAudioExtractorMixin):
             i = j
 
         return translated_lines, translations_made
+
+    def _traducir_bloque(self, translator, joined: str, protegidas: List[str]) -> List[str]:
+        """Traduce un bloque de líneas unidas con SEPARADOR_LINEAS; una parte por línea."""
+        translated_obj = self._translate_with_timeout(translator, joined)
+        translated_text = translated_obj.result if hasattr(translated_obj, "result") else str(translated_obj)
+        parts = _SEPARADOR_RE.split(translated_text.strip())
+        if len(parts) != len(protegidas):
+            # Yandex unió las líneas: de nuevo con saltos de línea (los respeta,
+            # aunque traduce cada línea con menos contexto).
+            parts = self._traducir_linea_suelta(translator, "\n".join(protegidas)).strip().split("\n")
+        if len(parts) != len(protegidas):
+            # Tampoco: una petición por línea, para no pegar dos líneas del
+            # subtítulo en una sola.
+            parts = [self._traducir_linea_suelta(translator, p) for p in protegidas]
+        return [self._normalizar_nombres(self._restaurar_nombres(p)) for p in parts]
 
     def _traducir_linea_suelta(self, translator, linea: str) -> str:
         """Traduce una línea sola; si falla, la deja como estaba."""
@@ -1227,6 +1357,8 @@ class SubtitleTranslator(WhisperAudioExtractorMixin):
             or line_stripped.lower().startswith("http")
             or "www" in line_stripped.lower()
             or "@" in line_stripped
+            # Sin letras ("…", "。"): Yandex responde 502 y no hay nada que traducir
+            or not any(ch.isalpha() for ch in _texto_visible(line_stripped))
         )
 
     def _attempt_translation(self, text_to_translate: str, translator, force_translate: bool) -> tuple[str, int]:
@@ -1438,9 +1570,17 @@ class SubtitleTranslator(WhisperAudioExtractorMixin):
                 srt_file = self._try_extract_audio_subtitles(video_file)
             else:
                 # 2. Verificar si ya tiene subtítulos en español (sidecar o pista embebida)
-                has_spanish_subs = self.check_existing_spanish_subtitles(
-                    video_file
-                ) or self._has_embedded_spanish_subtitles(video_file)
+                has_spanish_sidecar = self.check_existing_spanish_subtitles(video_file)
+                if not has_spanish_sidecar and not self.allow_retranslate:
+                    # El Roku no muestra el español incrustado: se publica como .es.srt
+                    exported = self._export_embedded_spanish(video_file)
+                    if exported:
+                        result["had_spanish_subtitles"] = True
+                        result["extracted"] = True
+                        result["subtitle_file"] = str(exported)
+                        self.translation_stats.subtitles_extracted += 1
+                        return result
+                has_spanish_subs = has_spanish_sidecar or self._has_embedded_spanish_subtitles(video_file)
                 if has_spanish_subs and not self.allow_retranslate:
                     result["had_spanish_subtitles"] = True
                     self.logger.debug(f"Ya tiene subtítulos en español: {video_file.name}")
@@ -2972,6 +3112,56 @@ class SubtitleTranslator(WhisperAudioExtractorMixin):
             for stream in self._detect_embedded_subtitle_streams(video_file)
         )
 
+    def _export_embedded_spanish(self, video_file: Path) -> Optional[Path]:
+        """Publica la pista española incrustada como {stem}.es.srt, sin traducir.
+
+        Toma la primera pista española completa y de texto que cubra el video, en el
+        orden del contenedor (el procesador pone primero la preferida).
+
+        Args:
+            video_file: Ruta del archivo de video.
+
+        Returns:
+            Optional[Path]: Ruta del .es.srt o None si no hay pista exportable.
+        """
+        streams = self._detect_embedded_subtitle_streams(video_file)
+        candidates = [
+            idx
+            for idx, stream in enumerate(streams)
+            if self._stream_language(stream) in SPANISH_LANG_CODES
+            and (stream.get("codec_name") or "").lower() in TEXT_SUBTITLE_CODECS
+            and not self._is_partial_subtitle_stream(stream)
+        ]
+        if not candidates:
+            return None
+
+        duration = self._media_duration(video_file)
+        output = video_file.parent / f"{video_file.stem}{SPANISH_SUBTITLE_SUFFIX}"
+        for relative_index in candidates:
+            extracted = self._extract_embedded_subtitles(video_file, relative_index, "es")
+            if not extracted:
+                continue
+            try:
+                if not self._subtitle_covers_video(extracted, duration):
+                    self.logger.info(f"Pista española 0:s:{relative_index} insuficiente, descartada")
+                    continue
+                content = _strip_font_tags(extracted.read_text(encoding="utf-8", errors="replace"))
+                tmp = output.with_suffix(output.suffix + ".tmp")
+                tmp.write_text(content, encoding="utf-8")
+                tmp.replace(output)
+            except OSError as e:
+                self.logger.error(f"No se pudo guardar {output.name}: {e}")
+                return None
+            finally:
+                extracted.unlink(missing_ok=True)
+
+            self.logger.info(
+                f"{EmojiGenerator.check_mark()} Subtítulo español incrustado publicado: "
+                f"{output.name} (stream 0:s:{relative_index})"
+            )
+            return output
+        return None
+
     def _rank_embedded_subtitle_streams(self, streams: list) -> List[Tuple[int, Dict[str, Any]]]:
         """
         Ordena las pistas embebidas utilizables como fuente de traducción.
@@ -3089,6 +3279,8 @@ class SubtitleTranslator(WhisperAudioExtractorMixin):
                 )
             else:
                 self.logger.info(f"{EmojiGenerator.check_mark()} Subtítulos embebidos extraídos: {output_srt}")
+
+            self._limpiar_srt_en_disco(output_srt)
 
             # Aplicar mejora de calidad a los subtítulos extraídos
             quality_lang = "en" if detected_lang in ENGLISH_LANG_CODES else detected_lang

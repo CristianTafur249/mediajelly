@@ -52,6 +52,9 @@ from typing import List, Optional
 from mediajelly_utils import MediaJellyPaths, create_compressed_rotating_file_handler
 from mediajelly_db import register, mark_missing_except, purge_missing, replace_subtitle_queue
 
+# Subtítulos de texto que el traductor puede exportar a .es.srt externo.
+EXPORTABLE_SUB_CODECS = {"subrip", "srt", "ass", "ssa", "webvtt", "mov_text"}
+
 # Comprobaciones simultáneas de subtítulos (un ffprobe por video)
 SUBTITLE_CHECK_WORKERS = 4
 
@@ -357,7 +360,9 @@ class MediaScanner:
         # Un .srt genérico que no es español NO cuenta: queda pendiente para que el
         # traductor lo traduzca (antes el video nunca volvía a la cola).
 
-        # 2. Verificar subtítulos embebidos en español con ffprobe
+        # 2. Subtítulos embebidos en español. Uno de texto no basta: el Roku no muestra
+        # mov_text incrustado, así que el traductor lo exporta a .es.srt. Uno de imagen
+        # (PGS) no se puede exportar y cuenta como resuelto para no reencolarlo siempre.
         try:
             probe_cmd = [
                 "ffprobe",
@@ -366,7 +371,7 @@ class MediaScanner:
                 "-select_streams",
                 "s",
                 "-show_entries",
-                "stream_tags=language:stream_disposition=forced",
+                "stream=codec_name:stream_tags=language:stream_disposition=forced",
                 "-of",
                 "json",
                 str(video_file),
@@ -385,7 +390,12 @@ class MediaScanner:
 
                 for stream in json.loads(result.stdout).get("streams", []):
                     lang = (stream.get("tags", {}).get("language") or "").strip().lower()
-                    if lang in spanish_codes and not stream.get("disposition", {}).get("forced"):
+                    codec = (stream.get("codec_name") or "").lower()
+                    if (
+                        lang in spanish_codes
+                        and not stream.get("disposition", {}).get("forced")
+                        and codec not in EXPORTABLE_SUB_CODECS
+                    ):
                         return True
 
         except Exception as e:

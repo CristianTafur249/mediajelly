@@ -1,12 +1,21 @@
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 from mediajelly_scanner import MediaScanner  # noqa: E402
-from mediajelly_subtitle_translator import SubtitleQualityImprover, SubtitleTranslator  # noqa: E402
+from mediajelly_subtitle_translator import (  # noqa: E402
+    SubtitleQualityImprover,
+    SubtitleTranslator,
+    TranslationStalledError,
+    _dividir_texto,
+    _es_dibujo_ass,
+    _limpiar_srt,
+    _strip_font_tags,
+)
 from mediajelly_whisper_extractor import (  # noqa: E402
     MAX_CUE_SECONDS,
     MIN_CUE_SECONDS,
@@ -373,3 +382,179 @@ def test_continuation_line_keeps_lowercase():
 
     assert "\nfamilias morirán." in out  # continúa la frase anterior: sin mayúscula forzada
     assert "\nRetírate o moriremos." in out  # tras un punto sí empieza frase
+
+
+def test_scanner_queues_text_embedded_spanish_without_sidecar(tmp_path, monkeypatch):
+    # El Roku no muestra mov_text incrustado: el video queda pendiente para exportar el .es.srt
+    scanner = MediaScanner.__new__(MediaScanner)
+    scanner.logger = _Logger()
+    video = tmp_path / "Video.mp4"
+    video.touch()
+
+    class _Probe:
+        returncode = 0
+        stdout = '{"streams": [{"codec_name": "mov_text", "tags": {"language": "spa"}, "disposition": {"forced": 0}}]}'
+
+    monkeypatch.setattr("mediajelly_scanner.subprocess.run", lambda *a, **k: _Probe())
+    assert not scanner._has_spanish_subtitle(video)
+
+    _write_srt(tmp_path / "Video.es.srt", cues=30)
+    assert scanner._has_spanish_subtitle(video)
+
+
+def test_strip_font_tags_keeps_italics():
+    texto = '<font face="Trebuchet MS" size="24"><i>Nuestra máxima prioridad</i></font>'
+    assert _strip_font_tags(texto) == "<i>Nuestra máxima prioridad</i>"
+
+
+def test_export_embedded_spanish_writes_clean_sidecar(translator, tmp_path, monkeypatch):
+    video = tmp_path / "Show S01E01.mp4"
+    video.touch()
+    streams = [_stream("mov_text", "spa", forced=1), _stream("mov_text", "spa"), _stream("mov_text", "spa")]
+    extracted = []
+
+    def fake_extract(video_file, relative_index, lang):
+        extracted.append(relative_index)
+        out = tmp_path / f"cand{relative_index}.srt"
+        return _write_srt(out, cues=300, text='<font face="Trebuchet MS" size="24">Hola</font>')
+
+    monkeypatch.setattr(translator, "_detect_embedded_subtitle_streams", lambda v: streams)
+    monkeypatch.setattr(translator, "_media_duration", lambda v: 1200.0)
+    monkeypatch.setattr(translator, "_extract_embedded_subtitles", fake_extract)
+
+    result = translator._export_embedded_spanish(video)
+
+    assert result == tmp_path / "Show S01E01.es.srt"
+    assert extracted == [1]  # la forzada se salta y basta la primera completa
+    content = result.read_text(encoding="utf-8")
+    assert "<font" not in content and "Hola" in content
+    assert not (tmp_path / "cand1.srt").exists()
+
+
+def test_export_embedded_spanish_ignores_image_tracks(translator, tmp_path, monkeypatch):
+    video = tmp_path / "Movie.mkv"
+    video.touch()
+    monkeypatch.setattr(
+        translator, "_detect_embedded_subtitle_streams", lambda v: [_stream("hdmv_pgs_subtitle", "spa")]
+    )
+    monkeypatch.setattr(translator, "_extract_embedded_subtitles", lambda *a: pytest.fail("no debe extraer"))
+
+    assert translator._export_embedded_spanish(video) is None
+
+
+def test_process_video_keeps_existing_spanish_sidecar(translator, tmp_path, monkeypatch):
+    video = tmp_path / "Show.mp4"
+    video.touch()
+    monkeypatch.setattr(translator, "quick_check_needs_processing", lambda v: True)
+    monkeypatch.setattr(translator, "_is_video_corrupted", lambda v: False)
+    monkeypatch.setattr(translator, "check_audio_tracks", lambda v: (False, []))
+    monkeypatch.setattr(translator, "check_existing_spanish_subtitles", lambda v: True)
+    monkeypatch.setattr(translator, "_export_embedded_spanish", lambda v: pytest.fail("no debe exportar"))
+
+    result = translator.process_video(video)
+
+    assert result["had_spanish_subtitles"] and not result["extracted"]
+
+
+def test_process_video_exports_embedded_spanish_without_translating(translator, tmp_path, monkeypatch):
+    video = tmp_path / "Show.mp4"
+    video.touch()
+    sidecar = tmp_path / "Show.es.srt"
+    monkeypatch.setattr(translator, "quick_check_needs_processing", lambda v: True)
+    monkeypatch.setattr(translator, "_is_video_corrupted", lambda v: False)
+    monkeypatch.setattr(translator, "check_audio_tracks", lambda v: (False, []))
+    monkeypatch.setattr(translator, "check_existing_spanish_subtitles", lambda v: False)
+    monkeypatch.setattr(translator, "_export_embedded_spanish", lambda v: sidecar)
+    monkeypatch.setattr(translator, "translate_srt", lambda *a, **k: pytest.fail("no debe traducir"))
+    translator.translation_stats = SimpleNamespace(subtitles_extracted=0)
+
+    result = translator.process_video(video)
+
+    assert result["extracted"] and result["subtitle_file"] == str(sidecar)
+    assert translator.translation_stats.subtitles_extracted == 1
+
+
+class _FakeYandex:
+    """Responde como Yandex: 502 sin letras, 413 por encima de 3000 caracteres."""
+
+    def __init__(self):
+        self.calls = []
+
+    def translate(self, text, dest):
+        self.calls.append(text)
+        if not any(ch.isalpha() for ch in text):
+            raise RuntimeError("502 | Unknown error. Error code: 502")
+        if len(text) > 3000:
+            raise RuntimeError("413 | ERR_TEXT_TOO_LONG")
+        return SimpleNamespace(result=text.upper())
+
+
+def _srt_lines(*textos):
+    lines = []
+    for n, texto in enumerate(textos, start=1):
+        lines += [f"{n}\n", f"00:00:{n:02d},000 --> 00:00:{n:02d},900\n", f"{texto}\n", "\n"]
+    return lines
+
+
+def test_es_dibujo_ass_con_casos_reales():
+    assert _es_dibujo_ass('<font face="Cabin F"size="50">m 64.78 11.69 l 64.4 6.85 b 64.37 6.3 64.44 5.66</font>')
+    assert _es_dibujo_ass('<font size="50">{=10}</font><b>m -237.47 -6.89 l -237.99 -6.43 -237.34 -5.87</b>')
+    assert not _es_dibujo_ass("m 5 km de aquí")
+    assert not _es_dibujo_ass("Hola")
+
+
+def test_limpiar_srt_quita_dibujos_y_renumera():
+    srt = (
+        "1\n00:00:01,000 --> 00:00:02,000\nHola\n\n"
+        "2\n00:00:02,000 --> 00:00:02,000\nm 1 2 l 3 4 5 6\n\n"
+        "3\n00:00:03,000 --> 00:00:04,000\nAdiós\n"
+    )
+
+    assert _limpiar_srt(srt) == "1\n00:00:01,000 --> 00:00:02,000\nHola\n\n2\n00:00:03,000 --> 00:00:04,000\nAdiós\n"
+    assert _limpiar_srt("1\n00:00:01,000 --> 00:00:02,000\nHola\n") == "1\n00:00:01,000 --> 00:00:02,000\nHola\n"
+
+
+def test_cues_sin_letras_no_se_envian_y_el_archivo_se_completa(translator):
+    yandex = _FakeYandex()
+    lines = _srt_lines("hello", *["…"] * 7, "。", "bye")
+
+    translated, made = translator._translate_lines_batch(lines, yandex)
+
+    assert made == 2
+    assert "HELLO\n" in translated and "BYE\n" in translated and "…\n" in translated
+    assert all(any(ch.isalpha() for ch in call) for call in yandex.calls)
+
+
+def test_linea_larga_se_divide_y_vuelve_unida(translator):
+    yandex = _FakeYandex()
+    larga = "Hola mundo. " * 600
+
+    translated, made = translator._translate_lines_batch(_srt_lines(larga.strip()), yandex)
+
+    assert made == 1 and len(yandex.calls) == 3
+    assert all(len(call) <= 3000 for call in yandex.calls)
+    assert translated[2].strip() == larga.strip().upper()
+
+
+def test_dividir_texto_japones_sin_espacios():
+    assert [len(t) for t in _dividir_texto("あ" * 7000)] == [3000, 3000, 1000]
+    assert _dividir_texto("corto") == ["corto"]
+
+
+def test_texto_repetido_se_traduce_una_vez(translator):
+    yandex = _FakeYandex()
+    translator._cache_traduccion = {}
+
+    translated, made = translator._translate_lines_batch(_srt_lines(*["Dead"] * 50), yandex)
+
+    assert yandex.calls == ["Dead"]
+    assert made == 50 and translated.count("DEAD\n") == 50
+
+
+def test_cinco_fallos_seguidos_siguen_abandonando(translator):
+    class _Caido:
+        def translate(self, text, dest):
+            raise TimeoutError("sin respuesta")
+
+    with pytest.raises(TranslationStalledError):
+        translator._translate_lines_batch(_srt_lines(*[f"line {n}" for n in range(6)]), _Caido())
