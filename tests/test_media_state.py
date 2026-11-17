@@ -319,11 +319,11 @@ def test_subtitle_queue_follows_rename(db, tmp_path):
     assert mediajelly_db.get_subtitle_queue() == [renamed]
 
 
-def test_schema_version_is_3(db):
+def test_schema_version_is_4(db):
     mediajelly_db.init_db()
-    assert _sql(db, "SELECT version FROM schema_version") == [(3,)]
+    assert _sql(db, "SELECT version FROM schema_version") == [(4,)]
     mediajelly_db.init_db()
-    assert _sql(db, "SELECT version FROM schema_version") == [(3,)]
+    assert _sql(db, "SELECT version FROM schema_version") == [(4,)]
 
 
 def _register_in_child(db_path: str, video_path: str, queue) -> None:
