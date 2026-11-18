@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block contenido %}
+{% if not grupos %}
+<p class="tarjeta">Nada por revisar.</p>
+{% endif %}
+{% for tipo, avisos in grupos.items() %}
+<section class="tarjeta">
+  <h2>{{ avisos[0].etiqueta }} ({{ avisos|length }})</h2>
+  <ul class="lista-avisos">
+    {% for a in avisos %}
+    <li>
+      <a href="/video/{{ a.fp|urlencode }}">{{ a.nombre }}</a>
+      {% if a.detalle %}<span class="suave"> · {{ a.detalle }}</span>{% endif %}
+      {% if a.creado %}<span class="suave"> · {{ a.creado }}</span>{% endif %}
+    </li>
+    {% endfor %}
+  </ul>
+</section>
+{% endfor %}
+{% endblock %}

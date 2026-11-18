@@ -13,6 +13,7 @@
     <div class="archivo-cabecera">
       <span class="video-ruta" title="{{ a.ruta }}">{{ a.ruta }}</span>
       {% set nombres_estado = {"pending": "Pendiente", "processing": "En proceso", "done": "Terminado", "skipped": "Omitido", "failed": "Cuarentena", "missing": "No está en disco"} %}<span class="insignia">{{ nombres_estado.get(a.estado, a.estado) }}</span>
+      {% for aviso in detalle.get('avisos', []) %}<span class="insignia aviso" title="{{ aviso.detalle }}">{{ aviso.etiqueta }}</span>{% endfor %}
     </div>
     <dl class="datos-video">
       {% if v.codec %}<div><dt>Video</dt><dd>{{ v.codec }}{% if v.ancho %} · {{ v.ancho }}×{{ v.alto }}{% endif %}</dd></div>{% endif %}

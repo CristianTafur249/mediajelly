@@ -133,7 +133,7 @@ def test_arranque_migra_bd_vieja(tmp_path):
         r = c.get("/cola")
         assert r.status_code == 200 and "Viejo.mkv" in r.text
     with sqlite3.connect(mediajelly_db._get_db_path()) as conn:
-        assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone()[0] == 3
+        assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone()[0] == 4
 
 
 def test_arranque_sigue_si_init_db_falla(monkeypatch, caplog):

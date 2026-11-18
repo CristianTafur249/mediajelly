@@ -9,7 +9,7 @@ import re
 import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 # Códecs de subtítulos de texto que se pueden convertir a mov_text. Los de
 # imagen (hdmv_pgs_subtitle, dvd_subtitle...) no entran en un MP4.
@@ -41,6 +41,12 @@ _PALABRA = re.compile(r"[a-z0-9ñáéíóúü]+")
 _DOS_A_TRES = {
     "fr": "fra", "de": "deu", "it": "ita", "pt": "por", "zh": "chi",
     "ru": "rus", "ar": "ara", "ko": "kor",
+}
+# Inverso, con los alias bibliográficos de ISO 639-2 que usan los MKV.
+_TRES_A_DOS = {
+    **{tres: dos for dos, tres in _DOS_A_TRES.items()},
+    "spa": "es", "eng": "en", "jpn": "ja",
+    "fre": "fr", "ger": "de", "zho": "zh", "rum": "ro", "ron": "ro", "dut": "nl", "nld": "nl",
 }
 
 # Variantes regionales. El MP4 solo guarda el idioma como ISO 639-2 ("spa") y
@@ -143,6 +149,63 @@ def idioma_iso(idioma: Optional[str]) -> Optional[str]:
     if re.fullmatch(r"[a-z]{3}", codigo):
         return codigo
     return _DOS_A_TRES.get(codigo)
+
+
+def idioma_639_1(idioma: Optional[str]) -> Optional[str]:
+    """Código de 2 letras para el nombre de un subtítulo ("{stem}.ja.srt").
+
+    spa/eng/jpn por idioma_base ("es-419" -> "es"); un código de 2 letras se deja
+    tal cual sin la región ("zh-cn" -> "zh"); uno de 3 letras conocido se
+    convierte ("kor" -> "ko", "fre" -> "fr"). Lo demás ("und", "unknown",
+    vacío) da None: el subtítulo queda con el nombre genérico.
+    """
+    base = idioma_base(idioma)
+    if base:
+        return _TRES_A_DOS[base]
+    palabras = _palabras(idioma)
+    if not palabras:
+        return None
+    codigo = palabras[0]
+    if re.fullmatch(r"[a-z]{2}", codigo):
+        return codigo
+    return _TRES_A_DOS.get(codigo)
+
+
+# Sufijo de idioma de un subtítulo: ".ja", ".es-419", ".en.sdh", ".hi".
+SUFIJO_SUBTITULO = re.compile(r"\.([a-z]{2,3}(?:-[a-z0-9]{2,4})?)(?:\.(hi|sdh|forced|cc))?$", re.IGNORECASE)
+
+
+def sufijo_idioma(nombre: str) -> Optional[Tuple[str, Optional[str]]]:
+    """(código, flag) si ``nombre`` (sin ".srt") termina en un sufijo de idioma válido.
+
+    "X.ja" -> ("ja", None); "X.en.sdh" -> ("en", "sdh"); "Doctor.Who" -> None,
+    porque "who" no es un código conocido.
+    """
+    m = SUFIJO_SUBTITULO.search(nombre)
+    if not m or idioma_639_1(m.group(1)) is None:
+        return None
+    return m.group(1).lower(), (m.group(2) or "").lower() or None
+
+
+def idioma_de_subtitulo(nombre: str, stem: str) -> Optional[Tuple[str, Optional[str]]]:
+    """Idioma de un subtítulo "{stem}.{código}[.flag].srt" del video ``stem``.
+
+    Args:
+        nombre: Nombre del archivo de subtítulo.
+        stem: Nombre del video sin extensión.
+
+    Returns:
+        (código, flag) o None si es el genérico "{stem}.srt" u otro nombre.
+    """
+    if not nombre.lower().endswith(".srt") or not nombre.startswith(stem + "."):
+        return None
+    resto = nombre[len(stem):-4]
+    if not resto:
+        return None
+    encontrado = sufijo_idioma(resto)
+    if not encontrado or SUFIJO_SUBTITULO.fullmatch(resto) is None:
+        return None
+    return encontrado
 
 
 def _codigo_region(idioma: Optional[str]) -> str:

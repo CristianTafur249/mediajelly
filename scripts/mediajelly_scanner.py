@@ -40,6 +40,7 @@ See Also:
     - mediajelly_language_detector.py: Detección de idiomas con Whisper
 """
 
+import glob
 import json
 import sys
 import time
@@ -51,6 +52,7 @@ from typing import List, Optional
 
 from mediajelly_utils import MediaJellyPaths, create_compressed_rotating_file_handler
 from mediajelly_db import register, mark_missing_except, purge_missing, replace_subtitle_queue
+from mediajelly_politica import idioma_639_1, idioma_de_subtitulo
 
 # Subtítulos de texto que el traductor puede exportar a .es.srt externo.
 EXPORTABLE_SUB_CODECS = {"subrip", "srt", "ass", "ssa", "webvtt", "mov_text"}
@@ -315,6 +317,12 @@ class MediaScanner:
             f"{video_stem}.spanish.srt",  # Español (nombre completo)
             f"{video_stem}.español.srt",  # Español (acentuado)
         ]
+
+        # Variantes regionales con el nuevo esquema: "{stem}.es-419.srt", "{stem}.es.sdh.srt"
+        for candidato in video_file.parent.glob(f"{glob.escape(video_stem)}.*.srt"):
+            idioma = idioma_de_subtitulo(candidato.name, video_stem)
+            if idioma and idioma_639_1(idioma[0]) == "es" and idioma[1] != "hi":
+                spanish_subtitle_patterns.append(candidato.name)
 
         # Buscar subtítulos en español (excluyendo .hi - hearing impaired)
         for pattern in spanish_subtitle_patterns:

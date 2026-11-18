@@ -34,7 +34,9 @@ except ImportError:  # importado como paquete (scripts.mediajelly_db)
 
 DB_LOCK = threading.Lock()
 MIGRATION_PENDING_MESSAGE = "Migración pendiente: ejecute mediajelly_migrate.py --apply"
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
+# Avisos que el panel muestra en "A revisar" y que Telegram notifica una vez.
+TIPOS_AVISO = ("audio_desfasado", "revisar_subtitulo")
 MAX_ATTEMPTS = 3
 FAILURE_WINDOW_HOURS = 24
 # Días de espera antes de volver a pasar por Whisper un archivo terminado
@@ -188,6 +190,17 @@ def _create_media_state_schema(conn: sqlite3.Connection) -> None:
             fingerprint TEXT PRIMARY KEY,
             failed_at TEXT,
             error TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS avisos (
+            fingerprint TEXT NOT NULL,
+            tipo TEXT NOT NULL,
+            detalle TEXT,
+            creado TEXT,
+            PRIMARY KEY (fingerprint, tipo)
         )
         """
     )
@@ -598,6 +611,7 @@ def _delete_fp(conn: sqlite3.Connection, fp: str) -> None:
     conn.execute("DELETE FROM retag_failures WHERE fingerprint = ?", (fp,))
     conn.execute("DELETE FROM subtitle_queue WHERE fingerprint = ?", (fp,))
     conn.execute("DELETE FROM language_attempts WHERE fingerprint = ?", (fp,))
+    conn.execute("DELETE FROM avisos WHERE fingerprint = ?", (fp,))
 
 
 def _move_fp(conn: sqlite3.Connection, old_fp: str, new_fp: str) -> None:
@@ -609,6 +623,7 @@ def _move_fp(conn: sqlite3.Connection, old_fp: str, new_fp: str) -> None:
     conn.execute("UPDATE OR REPLACE stream_languages SET fingerprint = ? WHERE fingerprint = ?", (new_fp, old_fp))
     conn.execute("UPDATE OR REPLACE subtitle_queue SET fingerprint = ? WHERE fingerprint = ?", (new_fp, old_fp))
     conn.execute("UPDATE OR REPLACE language_attempts SET fingerprint = ? WHERE fingerprint = ?", (new_fp, old_fp))
+    conn.execute("UPDATE OR REPLACE avisos SET fingerprint = ? WHERE fingerprint = ?", (new_fp, old_fp))
 
 
 def _clear_missing(conn: sqlite3.Connection, fp: str) -> None:
@@ -1111,6 +1126,86 @@ def record_language_attempt(fp: str) -> None:
                 (fp,),
             )
         conn.close()
+
+
+@retry_on_locked()
+def marcar_aviso(fp: str, tipo: str, detalle: str = "") -> bool:
+    """Marca un aviso para la huella (o actualiza su detalle).
+
+    Args:
+        fp: Huella del archivo.
+        tipo: Uno de TIPOS_AVISO.
+        detalle: Texto que muestran el panel y el aviso.
+
+    Returns:
+        True si el aviso no existía: quien notifica lo hace solo esa vez.
+
+    Raises:
+        ValueError: Si el tipo no está en TIPOS_AVISO.
+    """
+    if tipo not in TIPOS_AVISO:
+        raise ValueError(f"Tipo de aviso desconocido: {tipo}")
+    init_db()
+    with DB_LOCK:
+        conn = _get_conn()
+        try:
+            with conn:
+                existia = conn.execute(
+                    "SELECT 1 FROM avisos WHERE fingerprint = ? AND tipo = ?", (fp, tipo)
+                ).fetchone()
+                if existia:
+                    conn.execute(
+                        "UPDATE avisos SET detalle = ? WHERE fingerprint = ? AND tipo = ?", (detalle, fp, tipo)
+                    )
+                else:
+                    conn.execute(
+                        "INSERT INTO avisos(fingerprint, tipo, detalle, creado) VALUES (?, ?, ?, datetime('now'))",
+                        (fp, tipo, detalle),
+                    )
+        finally:
+            conn.close()
+    return existia is None
+
+
+@retry_on_locked()
+def quitar_aviso(fp: str, tipo: str) -> None:
+    """Quita un aviso de la huella; si no existe, no hace nada."""
+    init_db()
+    with DB_LOCK:
+        conn = _get_conn()
+        try:
+            with conn:
+                conn.execute("DELETE FROM avisos WHERE fingerprint = ? AND tipo = ?", (fp, tipo))
+        finally:
+            conn.close()
+
+
+@retry_on_locked()
+def listar_avisos(tipo: Optional[str] = None) -> List[Tuple[str, str, str, str, Optional[str]]]:
+    """Avisos marcados, los más recientes primero.
+
+    Args:
+        tipo: Si se da, solo los de ese tipo.
+
+    Returns:
+        Tuplas (huella, tipo, detalle, creado, ruta del archivo o None).
+    """
+    init_db()
+    with DB_LOCK:
+        conn = _get_conn()
+        try:
+            rows = conn.execute(
+                """
+                SELECT a.fingerprint, a.tipo, COALESCE(a.detalle, ''), a.creado, m.path
+                FROM avisos a LEFT JOIN media_files m ON m.fingerprint = a.fingerprint
+                WHERE ? IS NULL OR a.tipo = ?
+                ORDER BY a.creado DESC, a.fingerprint
+                """,
+                (tipo, tipo),
+            ).fetchall()
+        finally:
+            conn.close()
+    return [tuple(r) for r in rows]
 
 
 @retry_on_locked()

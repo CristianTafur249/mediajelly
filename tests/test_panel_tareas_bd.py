@@ -62,7 +62,7 @@ def test_migracion_agrega_prioridad_a_bd_existente(tmp_path, monkeypatch):
     conn.close()
     assert "prioridad" in columnas
     assert filas == [("x", 0)]
-    assert version == 3
+    assert version == 4
 
 
 def test_crear_tarea_no_duplica():
