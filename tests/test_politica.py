@@ -969,3 +969,17 @@ def test_punta_a_punta_subtitulo_mov_text_se_copia(tmp_path):
     r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "s", "-show_entries", "stream=codec_name",
                         "-of", "csv=p=0", str(salida)], capture_output=True, text=True, timeout=30, check=True)
     assert r.stdout.split() == ["mov_text"]
+
+
+@pytest.mark.parametrize(
+    "idioma, esperado",
+    [
+        ("spa", "es"), ("es-419", "es"), ("Spanish", "es"), ("jpn", "ja"), ("eng", "en"),
+        ("fra", "fr"), ("fre", "fr"), ("fr-ca", "fr"), ("zh-cn", "zh"), ("kor", "ko"),
+        ("ger", "de"), ("ja", "ja"), ("pt-BR", "pt"),
+        ("und", None), ("unknown", None), ("", None), (None, None), ("xyz", None),
+    ],
+)
+def test_idioma_639_1(idioma, esperado):
+    from mediajelly_politica import idioma_639_1
+    assert idioma_639_1(idioma) == esperado

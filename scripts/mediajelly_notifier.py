@@ -759,6 +759,15 @@ class TelegramNotifier:
 
         return self.send_long_message(message)
 
+    def notify_audio_desynced(self, nombre: str, segundos: float) -> bool:
+        """Avisa que la pista de audio no dura lo mismo que el video (doblaje de otro corte)."""
+        sentido = "menos" if segundos < 0 else "más"
+        message = (
+            f"🔊 Audio desfasado: {nombre}\n"
+            f"El audio dura {abs(segundos):.0f} s {sentido} que el video. Revisa o vuelve a descargar."
+        )
+        return self.send_long_message(message)
+
     def notify_critical_error(self, error_message: str, log_file: Optional[str] = None) -> bool:
         """Notificar errores críticos"""
         message = f"{EmojiGenerator.siren()} MediaJelly - Error Crítico\n\n"
@@ -846,6 +855,7 @@ def main():
         "subtitle_translation": _handle_subtitle_translation,
         "subtitle_paused": _handle_subtitle_paused,
         "process_queue": _handle_process_queue,
+        "audio_desynced": _handle_audio_desynced,
     }
 
     if command in command_handlers:
@@ -883,6 +893,14 @@ def _handle_scan_result(notifier: TelegramNotifier, args: list) -> bool:
     return notifier.notify_scan_result(
         status, files_found, files_new, files_processed, files_compressed, files_renamed, files_skipped
     )
+
+
+def _handle_audio_desynced(notifier: TelegramNotifier, args: list) -> bool:
+    """Maneja el comando audio_desynced (nombre, segundos)."""
+    if len(args) < 4:
+        print("Error: audio_desynced requiere 2 argumentos (nombre, segundos)")
+        return False
+    return notifier.notify_audio_desynced(args[2], float(args[3]))
 
 
 def _handle_no_pending(notifier: TelegramNotifier, args: list) -> bool:

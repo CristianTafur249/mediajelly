@@ -12,6 +12,7 @@ import json
 import logging
 import re
 import fcntl
+import glob
 import time
 from pathlib import Path
 from datetime import datetime
@@ -30,8 +31,12 @@ from mediajelly_whisper_extractor import (
     limpiar_nombre_nfo,
     referencias_nfo,
 )
+from mediajelly_calidad_subs import DESFASE_MAX_SEGUNDOS, desfase_audio
+from mediajelly_politica import SUFIJO_SUBTITULO, idioma_639_1, idioma_de_subtitulo, sufijo_idioma
 from mediajelly_db import (
+    get_by_path,
     get_pending_files,
+    marcar_aviso,
     get_subtitle_queue,
     load_progress,
     remove_from_subtitle_queue,
@@ -603,7 +608,7 @@ class SubtitleTranslator(WhisperAudioExtractorMixin):
             "-v",
             "error",
             "-show_entries",
-            "format=duration:stream=index,codec_type,codec_name,start_time"
+            "format=duration:stream=index,codec_type,codec_name,start_time,duration"
             ":stream_tags=language,title:stream_disposition=default,forced",
             "-of",
             "json",
@@ -777,13 +782,26 @@ class SubtitleTranslator(WhisperAudioExtractorMixin):
         """
         video_stem = video_file.stem
 
-        # Patrones de subtítulos priorizados por calidad
-        # (excluyendo español y hearing impaired)
+        # Prioridad: inglés, otros idiomas ("{stem}.ja.srt", como los deja la
+        # extracción), el genérico y ".sub.srt". Se excluyen español y los SDH/HI.
+        otros_idiomas = []
+        for candidato in sorted(video_file.parent.glob(f"{glob.escape(video_stem)}.*.srt")):
+            idioma = idioma_de_subtitulo(candidato.name, video_stem)
+            if not idioma or idioma[1] or idioma[0] == "hi":
+                continue
+            if candidato.name in (f"{video_stem}.en.srt", f"{video_stem}.eng.srt"):
+                continue  # ya van primero
+            if idioma_639_1(idioma[0]) == "es" and not self.allow_retranslate:
+                continue
+            otros_idiomas.append(candidato.name)
+        # Variantes de inglés ("en-us") antes que el resto; sort estable conserva el orden alfabético
+        otros_idiomas.sort(key=lambda nombre: not nombre[len(video_stem) + 1:].lower().startswith("en"))
         srt_priority_patterns = [
-            f"{video_stem}.en.srt",  # Inglés explícito (mejor calidad)
-            f"{video_stem}.eng.srt",  # Inglés ISO
-            f"{video_stem}.srt",  # Genérico (probablemente inglés)
-            f"{video_stem}.sub.srt",  # Subtítulos genéricos
+            f"{video_stem}.en.srt",
+            f"{video_stem}.eng.srt",
+            *otros_idiomas,
+            f"{video_stem}.srt",
+            f"{video_stem}.sub.srt",
         ]
 
         # Buscar en orden de prioridad
@@ -816,8 +834,8 @@ class SubtitleTranslator(WhisperAudioExtractorMixin):
             # Debe cubrir el video; si no (pista parcial o extracción incompleta) se ignora
             if not self._subtitle_covers_video(srt_file, self._media_duration(video_file)):
                 self.logger.info(f"Subtítulo existente insuficiente para la duración del video: {srt_file.name}")
-                if srt_file.name == f"{video_stem}.srt":
-                    # La extracción escribe en este mismo nombre: conservar copia del original
+                if srt_file.name != f"{video_stem}.sub.srt":
+                    # La extracción puede escribir en este mismo nombre: conservar copia del original
                     try:
                         srt_file.rename(srt_file.with_suffix(".srt.bak"))
                     except Exception as e:
@@ -895,7 +913,8 @@ class SubtitleTranslator(WhisperAudioExtractorMixin):
             text_lines = []
 
             for line in lines:
-                line_stripped = line.strip()
+                # Sin etiquetas <font ...> ni {\\an8}: su texto ("Gandhi Sans") confunde al detector
+                line_stripped = re.sub(r"<[^>]*>|\{[^}]*\}", "", line).strip()
                 if (
                     line_stripped
                     and not line_stripped.isdigit()
@@ -915,7 +934,10 @@ class SubtitleTranslator(WhisperAudioExtractorMixin):
             sample_text = " ".join(text_lines[::step][:40])
 
             try:
+                from langdetect import DetectorFactory
                 from langdetect import detect as _langdetect_detect
+
+                DetectorFactory.seed = 0  # sin semilla, el mismo texto da idiomas distintos entre corridas
                 detected_lang = _langdetect_detect(sample_text)
                 return detected_lang
             except Exception:
@@ -1498,12 +1520,36 @@ class SubtitleTranslator(WhisperAudioExtractorMixin):
             str: Nombre base sin extensiones de idioma.
         """
         base_name = srt_file.stem
-        # Quitar extensiones de idioma comunes del nombre base
-        for lang_ext in [".en", ".eng", ".es", ".spa", ".fre", ".ger", ".ita", ".por", ".rus", ".jpn", ".kor", ".chi"]:
-            if base_name.endswith(lang_ext):
-                base_name = base_name[: -len(lang_ext)]
+        # Si hay un video al lado, su nombre manda: "Show.It.srt" de "Show.It.mkv"
+        # no lleva sufijo de idioma aunque "It" lo parezca.
+        candidato = base_name
+        while candidato:
+            if any((srt_file.parent / f"{candidato}{ext}").exists() for ext in MediaJellyPaths.EXTENSIONS):
+                return candidato
+            if "." not in candidato:
                 break
+            candidato = candidato.rsplit(".", 1)[0]
+        # Sin video: quitar el sufijo de idioma y el flag (".ja", ".en.sdh", ".es-419")
+        if sufijo_idioma(base_name):
+            base_name = SUFIJO_SUBTITULO.sub("", base_name)
         return base_name
+
+    def _destino_srt(self, video_file: Path, srt: Path, idioma: Optional[str]) -> Path:
+        """Ruta final de un subtítulo extraído: "{stem}.{xx}.srt" o "{stem}.srt".
+
+        Args:
+            video_file: Video al que pertenece.
+            srt: Subtítulo extraído (para detectar el idioma si no viene dado).
+            idioma: Etiqueta de la pista o de Whisper; "und" o None se detecta del texto.
+
+        Returns:
+            Path: Ruta en la carpeta del video.
+        """
+        codigo = idioma_639_1(idioma)
+        if codigo is None:
+            codigo = idioma_639_1(self.detect_srt_language(srt))
+        sufijo = f".{codigo}.srt" if codigo else ".srt"
+        return video_file.parent / f"{video_file.stem}{sufijo}"
 
     def _cleanup_original_file(self, srt_file: Path):
         """
@@ -1556,6 +1602,9 @@ class SubtitleTranslator(WhisperAudioExtractorMixin):
                 result["error"] = "Video corrupto o inaccesible"
                 self.logger.error(f"{EmojiGenerator.error()} Video corrupto detectado: {video_file.name}")
                 return result
+
+            # 0.6. Audio de otro corte: se avisa, pero los subtítulos siguen al audio y se generan igual
+            self._revisar_desfase(video_file)
 
             # 1. Verificar audio en español
             has_spanish, _ = self.check_audio_tracks(video_file)
@@ -1637,6 +1686,42 @@ class SubtitleTranslator(WhisperAudioExtractorMixin):
             self.logger.error(f"Error procesando {video_file.name}: {e}")
 
         return result
+
+    def _revisar_desfase(self, video_file: Path) -> Optional[float]:
+        """Marca "audio_desfasado" si el audio y el video difieren más de DESFASE_MAX_SEGUNDOS.
+
+        Notifica por Telegram solo la primera vez por huella. Nunca interrumpe el procesamiento.
+
+        Args:
+            video_file: Video a revisar.
+
+        Returns:
+            Optional[float]: Desfase en segundos (audio - video) o None si no se pudo medir.
+        """
+        try:
+            desfase = desfase_audio(self._probe_media(video_file).get("data"))
+            if desfase is None or abs(desfase) <= DESFASE_MAX_SEGUNDOS:
+                return desfase
+            registro = get_by_path(video_file)
+            if registro is None:
+                return desfase
+            nuevo = marcar_aviso(registro.fingerprint, "audio_desfasado", f"audio {desfase:+.0f} s respecto al video")
+            self.logger.warning(f"Audio desfasado {desfase:+.1f} s: {video_file.name}")
+        except Exception as e:
+            self.logger.warning(f"No se pudo revisar el desfase de {video_file.name}: {e}")
+            return None
+        if nuevo:
+            notifier = Path(__file__).parent / "mediajelly_notifier.py"
+            try:
+                subprocess.run(
+                    [sys.executable, str(notifier), "audio_desynced", video_file.name, f"{desfase:.1f}"],
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+            except Exception as e:
+                self.logger.warning(f"No se pudo avisar el desfase por Telegram: {e}")
+        return desfase
 
     def _is_video_corrupted(self, video_file: Path) -> bool:
         """
@@ -1780,14 +1865,27 @@ class SubtitleTranslator(WhisperAudioExtractorMixin):
         srt_file = video_file.with_suffix(".srt")
         es_srt_file = video_file.with_suffix(SPANISH_SUBTITLE_SUFFIX)
 
-        # Solo procesar si existe .srt pero no .es.srt
-        if not srt_file.exists() or es_srt_file.exists():
+        # Solo procesar si no hay .es.srt
+        if es_srt_file.exists():
             return
 
         # Verificar si el archivo parece incompleto
-        if self._is_srt_file_incomplete(srt_file):
+        if srt_file.exists() and self._is_srt_file_incomplete(srt_file):
             srt_file.unlink()
             self.logger.debug(f"Eliminado archivo SRT incompleto: {srt_file.name}")
+
+        # Los ".{xx}.srt" solo se borran si están vacíos: uno reciente puede ser una
+        # descarga (Bazarr) y no un resultado a medias.
+        for candidato in video_file.parent.glob(f"{glob.escape(video_file.stem)}.*.srt"):
+            idioma = idioma_de_subtitulo(candidato.name, video_file.stem)
+            if not idioma or idioma_639_1(idioma[0]) == "es":
+                continue
+            try:
+                if candidato.stat().st_size < 100:
+                    candidato.unlink()
+                    self.logger.debug(f"Eliminado archivo SRT vacío: {candidato.name}")
+            except OSError:
+                pass
 
     def _is_srt_file_incomplete(self, srt_file: Path) -> bool:
         """
@@ -3040,8 +3138,8 @@ class SubtitleTranslator(WhisperAudioExtractorMixin):
                     pass
                 continue
 
-            # Mover a nombre base .srt de forma atómica (overwrite)
-            base_srt = video_file.parent / f"{video_file.stem}.srt"
+            # Mover a "{stem}.{idioma}.srt" de forma atómica (overwrite)
+            base_srt = self._destino_srt(video_file, extracted, lang)
             try:
                 base_srt_tmp = base_srt.with_suffix(base_srt.suffix + ".tmp")
                 if base_srt_tmp.exists():

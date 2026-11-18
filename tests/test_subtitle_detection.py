@@ -147,7 +147,7 @@ def test_embedded_extraction_takes_first_track_that_covers_video(translator, tmp
     result = translator._try_extract_embedded_subtitles(video)
 
     assert extracted == [0, 1]
-    assert result == tmp_path / "Show.srt"
+    assert result == tmp_path / "Show.en.srt"
     assert not (tmp_path / "cand0.srt").exists()
 
 

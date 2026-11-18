@@ -82,3 +82,14 @@ def test_srt_de_whisper_sale_sin_alucinaciones(tmp_path):
 
     texto = result.read_text(encoding="utf-8")
     assert texto.count("Bucle") == 1 and "…" not in texto
+
+
+def test_reparacion_incluye_srt_con_idioma(tmp_path):
+    from repair_whisper_hallucinations import subtitulos_whisper
+
+    (tmp_path / "Show.mkv").touch()
+    for nombre in ("Show.ja.srt", "Show.es.srt", "Show.srt", "Show.temp.srt", "Otro.ja.srt"):
+        (tmp_path / nombre).write_text("1\n00:00:00,000 --> 00:00:01,000\nhola\n", encoding="utf-8")
+
+    nombres = [p.name for p in subtitulos_whisper(tmp_path, {"Show"})]
+    assert nombres == ["Show.es.srt", "Show.ja.srt", "Show.srt"]
