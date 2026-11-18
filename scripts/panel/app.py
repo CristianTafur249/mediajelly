@@ -17,6 +17,7 @@ from starlette.middleware.sessions import SessionMiddleware
 
 import mediajelly_db
 from panel.servicios import acciones as servicio_acciones
+from panel.servicios import avisos as servicio_avisos
 from panel.servicios import bd as servicio_bd
 from panel.servicios import cola as servicio_cola
 from panel.servicios import detalle as servicio_detalle
@@ -162,6 +163,17 @@ def crear_app(password: str | None = None, secret: str | None = None) -> FastAPI
             request, "mas.html", {"titulo": "Más", "activo": "mas"}
         )
 
+    @app.get("/revisar", response_class=HTMLResponse, dependencies=[Depends(requiere_sesion)])
+    async def revisar(request: Request):
+        try:
+            grupos = await asyncio.to_thread(servicio_avisos.listar)
+        except Exception as exc:
+            registro.warning("Lectura de avisos fallida: %s", exc)
+            grupos = {}
+        return plantillas.TemplateResponse(
+            request, "revisar.html", {"titulo": "A revisar", "activo": "revisar", "grupos": grupos}
+        )
+
     @app.get("/cola", response_class=HTMLResponse, dependencies=[Depends(requiere_sesion)])
     async def cola(request: Request):
         datos = await asyncio.to_thread(servicio_cola.listar_cola)
@@ -206,6 +218,11 @@ def crear_app(password: str | None = None, secret: str | None = None) -> FastAPI
                 return RedirectResponse(f"/video/{quote(nueva, safe=':')}", status_code=303)
             contexto["titulo"] = "Video no encontrado"
             return plantillas.TemplateResponse(request, "video.html", contexto, status_code=404)
+        try:
+            detalle["avisos"] = await asyncio.to_thread(servicio_avisos.de_huella, fp)
+        except Exception as exc:
+            registro.warning("Lectura de avisos fallida: %s", exc)
+            detalle["avisos"] = []
         contexto.update(titulo=detalle["archivo"]["nombre"], detalle=detalle)
         return plantillas.TemplateResponse(request, "video.html", contexto)
 
