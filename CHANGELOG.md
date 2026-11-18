@@ -4,6 +4,15 @@ Registro de cambios del proyecto MediaJelly, un servidor multimedia automatizado
 
 ## [Sin publicar]
 
+### Subtítulos con idioma, verificación y audio desfasado
+
+- **Idioma en el nombre del subtítulo**: Whisper y las pistas incrustadas guardan `{video}.{idioma}.srt` (`.ja.srt`, `.en.srt`). Si ya es español queda solo `.es.srt`, sin el `.srt` duplicado que Jellyfin mostraba como «Desconocido». El traductor encuentra los `.{idioma}.srt` sin traducir y no los vuelve a transcribir.
+- **Audio normalizado antes de transcribir**: el audio que recibe Whisper pasa por filtros de voz (`highpass`, `lowpass`, `dynaudnorm`, `loudnorm`), para que los diálogos bajos no se pierdan bajo la música.
+- **Verificación de las transcripciones en español**: se mide qué parte de la voz quedó subtitulada, las alucinaciones y la confianza del modelo. Si no pasa, se reintenta una vez con un VAD más sensible y `beam_size=5`. Si sigue sin pasar, el archivo queda marcado «Subtítulo a revisar».
+- **Audio desfasado**: si una pista de audio dura más de 5 s más o menos que el video (doblaje de otro corte), se marca «Audio desfasado» y se avisa una sola vez por Telegram. Los subtítulos se generan igual.
+- **Panel**: vista «A revisar» con los avisos e insignias en el detalle del video.
+- **`mediajelly_renombrar_subs.py`**: pasa la biblioteca al nuevo esquema; borra los `.srt` idénticos al `.es.srt`, renombra los demás a su idioma y los `.hi.srt` en inglés a `.en.sdh.srt`. Con `--auditar-desfase` lista y marca el audio desfasado. Sin `--aplicar` solo muestra el plan.
+
 ### Recursos del equipo
 
 - **Prioridad baja frente al escritorio**: todos los servicios tienen `cpu_shares: 256`. Si el escritorio pide CPU, gana; si el equipo está libre, los contenedores usan toda la que tienen asignada.
