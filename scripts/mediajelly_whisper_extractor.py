@@ -26,8 +26,22 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from mediajelly_alucinaciones import filtrar_cues
+from mediajelly_calidad_subs import Evaluacion, evaluar, tramos_de_voz
+from mediajelly_db import get_by_path, marcar_aviso, quitar_aviso
 from mediajelly_emoji import EmojiGenerator
+from mediajelly_politica import idioma_639_1
 import mediajelly_progreso as progreso
+
+# Voz más clara para Whisper: quita graves y agudos que no son voz y nivela el
+# volumen (diálogos bajos bajo música). Ningún filtro desplaza los tiempos.
+FILTRO_VOZ = "highpass=f=80,lowpass=f=7500,dynaudnorm=f=150:g=15:p=0.9,loudnorm=I=-16:TP=-1.5"
+# Reintento de una transcripción en español que no pasa la verificación
+PARAMETROS_ROBUSTOS: Dict[str, Any] = {
+    "language": "es",
+    "beam_size": 5,
+    "vad_parameters": {"threshold": 0.2, "min_silence_duration_ms": 1000, "speech_pad_ms": 400},
+    "no_speech_threshold": 0.7,
+}
 
 # Importaciones opcionales con manejo de errores
 try:
@@ -158,6 +172,7 @@ class WhisperAudioExtractorMixin:
             transcription_result = self._transcribe_audio_with_whisper(audio_file)
             if not transcription_result:
                 return None
+            transcription_result, evaluacion = self._verificar_y_reintentar(audio_file, transcription_result)
 
             # Generar archivo SRT desde la transcripción (aún en tmp_dir, nombre temporal)
             temp_srt = self._generate_srt_from_transcription(transcription_result, output_srt)
@@ -169,7 +184,9 @@ class WhisperAudioExtractorMixin:
             # check_existing_spanish_subtitles()/find_existing_srt_file() nunca lo
             # encontraban en la siguiente ejecución y el video se re-procesaba
             # indefinidamente, además de acumular huérfanos en scripts/tmp).
-            return self._move_srt_to_video_folder(temp_srt, video_file)
+            final_srt = self._move_srt_to_video_folder(temp_srt, video_file, transcription_result.get("language"))
+            self._registrar_evaluacion(video_file, evaluacion)
+            return final_srt
 
         except subprocess.TimeoutExpired:
             self.logger.error("Timeout extrayendo audio (15 minutos)")
@@ -181,21 +198,27 @@ class WhisperAudioExtractorMixin:
             # LIMPIEZA: Eliminar archivos temporales SIEMPRE, incluso en errores
             self._cleanup_temp_files(audio_file)
 
-    def _move_srt_to_video_folder(self, temp_srt: Path, video_file: Path) -> Optional[Path]:
+    def _move_srt_to_video_folder(
+        self, temp_srt: Path, video_file: Path, idioma: Optional[str] = None
+    ) -> Optional[Path]:
         """
-        Mueve un SRT generado en tmp_dir a la carpeta del video, con el nombre
-        canónico "{video_stem}.srt" (mismo esquema que usa la extracción de
-        subtítulos embebidos). Evita nombres volátiles basados en mtime_ns que
-        rompen la detección de subtítulos ya procesados.
+        Mueve un SRT generado en tmp_dir a la carpeta del video como "{stem}.{idioma}.srt".
+
+        Con el idioma en el nombre Jellyfin no lo muestra como "Desconocido" y, si es
+        español, queda directamente como ".es.srt" sin copia duplicada. Sin idioma
+        reconocible se usa "{stem}.srt".
 
         Args:
             temp_srt: Ruta del SRT en tmp_dir (nombre con sufijo mtime_ns).
             video_file: Ruta del video original.
+            idioma: Idioma detectado por Whisper ("ja", "es"...).
 
         Returns:
             Optional[Path]: Ruta final en la carpeta del video, o None si falló el movimiento.
         """
-        final_srt = video_file.parent / f"{video_file.stem}.srt"
+        codigo = idioma_639_1(idioma)
+        sufijo = f".{codigo}.srt" if codigo else ".srt"
+        final_srt = video_file.parent / f"{video_file.stem}{sufijo}"
         try:
             final_tmp = final_srt.with_suffix(final_srt.suffix + ".tmp")
             if final_tmp.exists():
@@ -278,7 +301,7 @@ class WhisperAudioExtractorMixin:
             "-i",
             str(video_file),
             "-af",
-            "aresample=async=1:first_pts=0",  # WAV alineado a t=0 aunque el audio tenga retardo inicial
+            f"aresample=async=1:first_pts=0,{FILTRO_VOZ}",  # alineado a t=0 y con la voz normalizada
             "-ar",
             "16000",  # Whisper requiere 16kHz
             "-ac",
@@ -321,7 +344,7 @@ class WhisperAudioExtractorMixin:
             "-i",
             str(video_file),
             "-af",
-            "aresample=async=1:first_pts=0",  # WAV alineado a t=0 aunque el audio tenga retardo inicial
+            f"aresample=async=1:first_pts=0,{FILTRO_VOZ}",  # alineado a t=0 y con la voz normalizada
             "-ar",
             "16000",  # Whisper requiere 16kHz
             "-ac",
@@ -645,16 +668,17 @@ class WhisperAudioExtractorMixin:
         # y deje de poner puntuación en los diálogos.
         return "Personajes: " + ", ".join(hints) + "."
 
-    def _transcribe_with_faster_whisper(self, audio_file: Path) -> Optional[dict]:
+    def _transcribe_with_faster_whisper(self, audio_file: Path, robusto: bool = False) -> Optional[dict]:
         """
         Transcribe audio con faster-whisper usando filtro de voz (VAD) y marcas por
         palabra, lo que evita cues estirados sobre silencios o música.
 
         Args:
             audio_file: Ruta del archivo de audio.
+            robusto: Usa PARAMETROS_ROBUSTOS (reintento en español con VAD más sensible).
 
         Returns:
-            Optional[dict]: Resultado con claves `segments` y `language`, o None si no hubo voz.
+            Optional[dict]: `segments`, `language` y `logprob_medio`, o None si no hubo voz.
         """
         with whisper_lock:
             model = getattr(self, "_faster_whisper_model", None)
@@ -682,12 +706,17 @@ class WhisperAudioExtractorMixin:
                     raise RuntimeError("No se pudo cargar ningún modelo de faster-whisper")
                 self._faster_whisper_model = model
 
+            parametros: Dict[str, Any] = {
+                "language": (self.force_language if getattr(self, "force_language", None) else None),
+                "vad_parameters": {"min_silence_duration_ms": 500},
+            }
+            if robusto:
+                parametros = dict(PARAMETROS_ROBUSTOS)
             segments_iter, info = model.transcribe(
                 str(audio_file),
-                language=(self.force_language if getattr(self, "force_language", None) else None),
                 task="transcribe",
                 vad_filter=True,
-                vad_parameters={"min_silence_duration_ms": 500},
+                **parametros,
                 word_timestamps=True,
                 condition_on_previous_text=False,
                 # Nombres de personajes y título: evita que el modelo invente su grafía
@@ -696,6 +725,7 @@ class WhisperAudioExtractorMixin:
             self.logger.info(f"Idioma detectado por faster-whisper: {info.language}")
 
             segments: List[Dict[str, Union[float, str]]] = []
+            logprobs: List[float] = []
             # Barra de progreso solo en ejecuciones manuales (terminal interactiva)
             show_progress = sys.stderr.isatty() and getattr(info, "duration", 0) > 0
             # Avance para el panel (accesorio: nunca interrumpe la transcripción)
@@ -716,6 +746,8 @@ class WhisperAudioExtractorMixin:
                     if ahora - ultimo_aviso >= PROGRESO_INTERVALO_SEGUNDOS:
                         progreso.actualizar("subtitulos", segment.end)
                         ultimo_aviso = ahora
+                    if getattr(segment, "avg_logprob", None) is not None:
+                        logprobs.append(float(segment.avg_logprob))
                     words = [(w.start, w.end, w.word) for w in (segment.words or [])]
                     if words:
                         segments.extend(self._split_words_into_cues(words))
@@ -733,7 +765,67 @@ class WhisperAudioExtractorMixin:
 
         if not segments:
             return None
-        return {"segments": segments, "language": info.language}
+        logprob_medio = sum(logprobs) / len(logprobs) if logprobs else None
+        return {"segments": segments, "language": info.language, "logprob_medio": logprob_medio}
+
+    def _leer_tramos_voz(self, audio_file: Path) -> List[Tuple[float, float]]:
+        """Tramos de voz del wav a 16 kHz que se transcribe."""
+        from faster_whisper.audio import decode_audio
+
+        return tramos_de_voz(decode_audio(str(audio_file), sampling_rate=16000))
+
+    def _verificar_y_reintentar(self, audio_file: Path, resultado: dict) -> Tuple[dict, Optional[Evaluacion]]:
+        """Verifica una transcripción en español y, si no pasa, reintenta una vez.
+
+        El reintento usa PARAMETROS_ROBUSTOS y se queda con el de mayor cobertura.
+        Nunca pierde el resultado original: cualquier error se registra y se devuelve tal cual.
+
+        Args:
+            audio_file: Wav que se transcribió.
+            resultado: Resultado de la primera transcripción.
+
+        Returns:
+            (resultado elegido, evaluación); evaluación None si no se verificó.
+        """
+        if resultado.get("language") != "es":
+            return resultado, None
+        try:
+            tramos = self._leer_tramos_voz(audio_file)
+        except Exception as e:
+            self.logger.warning(f"No se pudo medir la voz para verificar la transcripción: {e}")
+            return resultado, None
+        evaluacion = evaluar(resultado["segments"], tramos, resultado.get("logprob_medio"))
+        if evaluacion.ok or not FASTER_WHISPER_AVAILABLE:
+            return resultado, evaluacion
+
+        self.logger.warning(f"Transcripción dudosa ({'; '.join(evaluacion.motivos)}), se reintenta")
+        try:
+            segundo = self._transcribe_with_faster_whisper(audio_file, robusto=True)
+        except Exception as e:
+            self.logger.error(f"Falló el reintento de la transcripción, se conserva la primera: {e}")
+            return resultado, evaluacion
+        if not segundo:
+            return resultado, evaluacion
+        evaluacion2 = evaluar(segundo["segments"], tramos, segundo.get("logprob_medio"))
+        if evaluacion2.cobertura > evaluacion.cobertura:
+            self.logger.info(f"Reintento mejor: cobertura {evaluacion.cobertura:.2f} -> {evaluacion2.cobertura:.2f}")
+            return segundo, evaluacion2
+        return resultado, evaluacion
+
+    def _registrar_evaluacion(self, video_file: Path, evaluacion: Optional[Evaluacion]) -> None:
+        """Marca o quita el aviso "revisar_subtitulo"; un error de BD no afecta al SRT."""
+        if evaluacion is None:
+            return
+        try:
+            registro = get_by_path(video_file)
+            if registro is None:
+                return
+            if evaluacion.ok:
+                quitar_aviso(registro.fingerprint, "revisar_subtitulo")
+            else:
+                marcar_aviso(registro.fingerprint, "revisar_subtitulo", "; ".join(evaluacion.motivos))
+        except Exception as e:
+            self.logger.warning(f"No se pudo registrar la verificación de {video_file.name}: {e}")
 
     @staticmethod
     def _latido_progreso(parar: threading.Event) -> None:
