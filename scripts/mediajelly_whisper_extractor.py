@@ -25,6 +25,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+from mediajelly_alucinaciones import filtrar_cues
 from mediajelly_emoji import EmojiGenerator
 import mediajelly_progreso as progreso
 
@@ -897,7 +898,10 @@ class WhisperAudioExtractorMixin:
         Returns:
             Optional[Path]: Ruta del archivo SRT generado o None.
         """
-        cues = self._normalize_cues(result["segments"])
+        segmentos, quitados = filtrar_cues(list(result["segments"]))
+        if quitados:
+            self.logger.info(f"Alucinaciones de Whisper corregidas: {quitados} cues")
+        cues = self._normalize_cues(segmentos)
         self.logger.info(f"Generando archivo SRT con {len(cues)} segmentos")
 
         with open(output_srt, "w", encoding="utf-8") as f:

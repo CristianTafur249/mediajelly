@@ -4,12 +4,23 @@ Registro de cambios del proyecto MediaJelly, un servidor multimedia automatizado
 
 ## [Sin publicar]
 
+### Recursos del equipo
+
+- **Prioridad baja frente al escritorio**: todos los servicios tienen `cpu_shares: 256`. Si el escritorio pide CPU, gana; si el equipo está libre, los contenedores usan toda la que tienen asignada.
+- **Reservas de memoria**: `mediajelly-cron` y `jellyfin` reservan 512 MB en lugar de 2 GB. Los límites (`mem_limit`) no cambian. `oom_score_adj: 500` en `mediajelly-cron`, `jellyfin` y `flaresolverr`: si se agota la RAM, el kernel los elige antes que a las aplicaciones del escritorio.
+- **`scripts/modo.sh`**: modo trabajo (L-V 07:30-18:30) y modo libre, aplicados en vivo con `docker update`, sin reiniciar el stack:
+  - en modo trabajo, `mediajelly-cron` y `jellyfin` bajan a 1.5 CPUs y se detienen `flaresolverr`, `jackett`, `bazarr` y `seerr`;
+  - `modo.sh --instalar` crea un timer de usuario que cambia de modo a las 07:30 y 18:30 y al iniciar sesión.
+
 ### Correcciones
 
 - **Zona horaria en los jobs de cron**: el entrypoint aplica `TZ` a `/etc/localtime` en cada arranque. Antes cron lanzaba los scripts sin `TZ` y veían UTC, por lo que la "noche" caía entre las 19:00 y las 00:59 hora local.
 - **Corte real de subtítulos a las 06:00**: el cron runner lanza el traductor como subproceso y lo termina (con ffmpeg/Whisper) al acabar la ventana 00:00-05:59. El progreso se conserva y se reanuda la noche siguiente.
 - **4K/UHD a 1080p en la compresión**: el procesador recodifica el contenido 2160p a 1080p (con tonemapping a SDR si es HDR) en lugar de remuxarlo. Antes un H.264 4K de bitrate bajo pasaba como "ya optimizado" y el Roku Express no podía reproducirlo.
 - **Escáner**: un `.srt` genérico que no está en español ya no cuenta como "tiene subtítulos"; el video queda pendiente para traducirlo.
+- **Subtítulos en el Roku**: el Roku no muestra los subtítulos `mov_text` incrustados en el MP4 (Jellyfin los extrae al vuelo y llegan tarde). Ahora el traductor publica la pista española incrustada como `.es.srt` externo, sin traducir y sin etiquetas `<font>`, y el escáner encola los videos que solo tienen el español incrustado. Las pistas de imagen (PGS) siguen contando como resueltas.
+- **Errores fijos de la traducción**: cuatro videos fallaban en cada ciclo ("5 fallos seguidos"). Ahora se quitan del `.srt` los dibujos vectoriales de los ASS, que eran cues de hasta 60 000 caracteres (el `.srt` de JJK S03E03 pasa de 215 MB a 2 MB). Tampoco se envían los cues sin letras (`…`, `。`), a los que Yandex responde 502. Las líneas de más de 3000 caracteres se traducen por partes, y el texto repetido de la rotulación se traduce una sola vez por archivo.
+- **Alucinaciones de Whisper**: la transcripción quita los bucles (la misma frase en 3 o más cues seguidos), los créditos inventados ("Amara.org") y los cues sin texto, y reduce las repeticiones de caracteres y palabras. `repair_whisper_hallucinations.py --write` corrige los `.srt` y `.es.srt` ya transcritos.
 
 ### Rendimiento del ciclo
 
